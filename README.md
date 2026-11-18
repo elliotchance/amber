@@ -26,27 +26,35 @@ was at any point in time.
 
 ## Install
 
-Download the zip for your system from the
-[latest release](https://github.com/elliotchance/amber/releases/latest), unzip
-it and put `amber` somewhere on your `PATH`. For example, on a Mac with Apple
-silicon:
+Run the command for your system. It downloads the latest release and puts
+`amber` in `/usr/local/bin`. Run it again to update.
 
-```sh
-curl -fsSLO https://github.com/elliotchance/amber/releases/latest/download/amber-macos-arm64.zip
-unzip amber-macos-arm64.zip
-sudo mv amber /usr/local/bin/
+macOS (Apple silicon):
+
+```bash
+curl -fsSL https://github.com/elliotchance/amber/releases/latest/download/amber-macos-arm64.zip -o /tmp/amber.zip && sudo unzip -o /tmp/amber.zip -d /usr/local/bin && rm /tmp/amber.zip
 ```
 
-| System | Zip |
-|---|---|
-| macOS (Apple silicon) | `amber-macos-arm64.zip` |
-| macOS (Intel) | `amber-macos-x86-64.zip` |
-| Linux (x86-64) | `amber-linux-x86-64.zip` |
-| Linux (ARM64) | `amber-linux-arm64.zip` |
+macOS (Intel):
 
-To update, do the same again. Existing backups are upgraded automatically the
-first time the new version opens them. A backup used by a newer amber can't be
-opened by an older one.
+```bash
+curl -fsSL https://github.com/elliotchance/amber/releases/latest/download/amber-macos-x86-64.zip -o /tmp/amber.zip && sudo unzip -o /tmp/amber.zip -d /usr/local/bin && rm /tmp/amber.zip
+```
+
+Linux (x86-64):
+
+```bash
+curl -fsSL https://github.com/elliotchance/amber/releases/latest/download/amber-linux-x86-64.zip -o /tmp/amber.zip && sudo unzip -o /tmp/amber.zip -d /usr/local/bin && rm /tmp/amber.zip
+```
+
+Linux (ARM64):
+
+```bash
+curl -fsSL https://github.com/elliotchance/amber/releases/latest/download/amber-linux-arm64.zip -o /tmp/amber.zip && sudo unzip -o /tmp/amber.zip -d /usr/local/bin && rm /tmp/amber.zip
+```
+
+Existing backups are upgraded automatically the first time a new version
+opens them. A backup used by a newer amber can't be opened by an older one.
 
 ## Usage
 
