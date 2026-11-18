@@ -24,6 +24,34 @@ was at any point in time.
   mounted anywhere.
 - **Scriptable.** Every command exits with a code that says what failed.
 
+## Install
+
+amber is built from source. It needs [V](https://vlang.io) and zlib, which
+macOS already has (on Linux install `zlib1g-dev` or your distribution's
+equivalent).
+
+```sh
+git clone https://github.com/elliotchance/amber.git
+cd amber
+v install elliotchance.vsql
+v -prod -o amber .
+sudo mv amber /usr/local/bin/
+```
+
+### Update
+
+From the `amber` folder:
+
+```sh
+git pull
+v update
+v -prod -o amber .
+sudo mv amber /usr/local/bin/
+```
+
+Existing backups are upgraded automatically the first time the new version
+opens them. A backup used by a newer amber can't be opened by an older one.
+
 ## Usage
 
 Every command takes `-d folder` for the backup folder, which defaults to the
@@ -193,16 +221,8 @@ Every command uses the same exit codes, so scripts can tell what failed:
 | 26 | The path was deleted at that time |
 | 30 | `fsck` found problems |
 
-Upgrading amber is safe: existing backups are upgraded automatically the
-first time they're opened.
-
-## Building
-
-Needs [V](https://vlang.io) and zlib (`libz`), which macOS has. On Linux
-install its headers (for example `zlib1g-dev`).
+## Development
 
 ```sh
-v install elliotchance.vsql
-v -o amber .
 v test .
 ```
