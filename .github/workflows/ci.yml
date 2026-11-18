@@ -74,7 +74,6 @@ jobs:
           ./amber init -d "$RUNNER_TEMP/backup" --include "$PWD" --exclude .git
           ./amber backup -d "$RUNNER_TEMP/backup"
           ./amber fsck -d "$RUNNER_TEMP/backup" --hash
-| head -3
           zip amber-${{ matrix.os }}.zip amber
 
       - name: Upload zip
