@@ -1,55 +1,137 @@
 module main
 
 import os
-import elliotchance.vsql.vsql
+import flag
+import time
 
 const default_db_path = 'amber.vsql'
 
 const usage = 'usage:
-  amber init [file.vsql]    create (or update) the backup file
-  amber backup [file.vsql]  back up the current folder
+  amber init [-f file.vsql] --destination folder --include path ... [--exclude pattern ...]
+      Create a new backup file. --include and --exclude can be repeated.
+      Includes are applied before excludes. An exclude without a "/" matches
+      file and folder names (like "*.tmp"), otherwise it matches full paths.
 
-file.vsql defaults to ${default_db_path} in the current folder.'
+  amber backup [-f file.vsql]
+      Back up every included file that is new or has changed.
+
+  amber ls [-f file.vsql] [-t time] path ...
+      List files and folders as they were at time (default now). time is
+      YYYY-MM-DD [HH:MM[:SS]] in local time; a date alone is the end of that day.
+
+  amber restore [-f file.vsql] [-t time] path target
+      Restore path (a file or folder) as it was at time (default now) into the
+      target folder, which must not exist yet.
+
+  amber stats [-f file.vsql]
+      Show what is backed up and how much space it uses.
+
+-f defaults to ${default_db_path} in the current folder.'
 
 fn main() {
-	args := os.args[1..]
-	if args.len == 0 || args.len > 2 {
+	if os.args.len < 2 {
 		exit_with_usage()
 	}
-
-	path := if args.len == 2 { args[1] } else { default_db_path }
-
-	match args[0] {
-		'init' { cmd_init(path) or { fail(err) } }
-		'backup' { cmd_backup(path) or { fail(err) } }
+	args := os.args[2..]
+	match os.args[1] {
+		'init' { cmd_init(args) or { fail(err) } }
+		'backup' { cmd_backup(args) or { fail(err) } }
+		'ls' { cmd_ls(args) or { fail(err) } }
+		'restore' { cmd_restore(args) or { fail(err) } }
+		'stats' { cmd_stats(args) or { fail(err) } }
 		else { exit_with_usage() }
 	}
 }
 
-// cmd_init creates the backup file, or updates it if it already exists.
-fn cmd_init(path string) ! {
-	exists := os.exists(path)
-	mut db := vsql.open(path)!
-	defer {
-		db.close()
+fn cmd_init(args []string) ! {
+	mut fp := flag.new_flag_parser(args)
+	db_path := fp.string('file', `f`, default_db_path, '')
+	destination := fp.string('destination', 0, '', '')
+	includes := fp.string_multi('include', 0, '')
+	excludes := fp.string_multi('exclude', 0, '')
+	fp.finalize()!
+
+	if destination == '' {
+		return error('--destination is required')
+	}
+	if !os.is_dir(destination) {
+		return error('destination ${destination} is not a folder')
+	}
+	if includes.len == 0 {
+		return error('at least one --include is required')
+	}
+	mut abs_includes := []string{}
+	for include in includes {
+		if !os.exists(include) {
+			return error('include ${include} does not exist')
+		}
+		abs_includes << os.real_path(include)
 	}
 
-	if exists {
-		println('updated ${path}')
-	} else {
-		println('created ${path}')
+	create_database(db_path, Config{
+		destination: os.real_path(destination)
+		includes:    abs_includes
+		excludes:    excludes
+	})!
+	println('created ${db_path}')
+}
+
+fn cmd_backup(args []string) ! {
+	mut fp := flag.new_flag_parser(args)
+	db_path := fp.string('file', `f`, default_db_path, '')
+	fp.finalize()!
+
+	result := backup(db_path, time_to_us(time.utc()), fn (line string) {
+		println(line)
+	})!
+	mut summary := '${result.new} new, ${result.changed} changed, ${result.deleted} deleted, ${result.unchanged} unchanged'
+	if result.skipped > 0 {
+		summary += ', ${result.skipped} skipped'
+	}
+	println(summary)
+}
+
+fn cmd_ls(args []string) ! {
+	mut fp := flag.new_flag_parser(args)
+	db_path := fp.string('file', `f`, default_db_path, '')
+	at := fp.string('time', `t`, '', '')
+	paths := fp.finalize()!
+	if paths.len == 0 {
+		return error('ls needs at least one path')
+	}
+
+	as_of := if at == '' { time_to_us(time.utc()) } else { parse_local_time(at)! }
+	for line in ls(db_path, paths, as_of)! {
+		println(line)
 	}
 }
 
-// cmd_backup backs up the current folder into an existing backup file.
-fn cmd_backup(path string) ! {
-	if !os.exists(path) {
-		return error('${path} does not exist, run "amber init ${path}" to create it')
+fn cmd_restore(args []string) ! {
+	mut fp := flag.new_flag_parser(args)
+	db_path := fp.string('file', `f`, default_db_path, '')
+	at := fp.string('time', `t`, '', '')
+	paths := fp.finalize()!
+	if paths.len != 2 {
+		return error('restore needs a path and a target folder')
+	}
+	if os.exists(paths[1]) {
+		return error('${paths[1]} already exists')
 	}
 
-	mut db := vsql.open(path)!
-	defer {
-		db.close()
+	as_of := if at == '' { time_to_us(time.utc()) } else { parse_local_time(at)! }
+	n := restore(db_path, paths[0], paths[1], as_of, fn (line string) {
+		println(line)
+	})!
+	println('${n} restored')
+}
+
+fn cmd_stats(args []string) ! {
+	mut fp := flag.new_flag_parser(args)
+	db_path := fp.string('file', `f`, default_db_path, '')
+	fp.finalize()!
+
+	for line in stats(db_path, time_to_us(time.utc()))! {
+		println(line)
 	}
 }
 
