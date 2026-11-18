@@ -6,7 +6,7 @@ import elliotchance.vsql.vsql
 struct PruneStats {
 mut:
 	versions int // rows removed from files
-	objects  int // objects removed from the destination
+	objects  int // objects removed from the backup folder
 	bytes    i64 // stored bytes freed
 }
 
@@ -32,6 +32,31 @@ fn prune(mut db vsql.Connection, config Config, log fn (string)) !PruneStats {
 		return PruneStats{}
 	}
 
+	mut p := plan_prune(mut db, config) or { return at(.read_index, err) }
+	if p.remove.len == 0 {
+		return PruneStats{}
+	}
+	delete_pruned(mut db, p) or { return at(.write_index, err) }
+
+	// Only once the rows are gone, so the index never points at a missing
+	// object. Failing to remove a file only leaves an unused object behind.
+	for sha in p.freed {
+		path := object_path(config.dir, sha)
+		os.rm(path) or {}
+		remove_empty_parents(path)
+	}
+
+	result := PruneStats{
+		versions: p.remove.len
+		objects:  p.freed.len
+		bytes:    p.freed_bytes()
+	}
+	log('pruned   ${result.versions} old versions, ${result.objects} objects, ${human_size(result.bytes)}')
+	return result
+}
+
+// plan_prune works out which versions to remove, and which objects that frees.
+fn plan_prune(mut db vsql.Connection, config Config) !Pruner {
 	mut by_path := map[string][]PruneRow{}
 	mut refs := map[string]int{}
 	for row in db.query('SELECT id, path, version, sha256 FROM files ORDER BY id')! {
@@ -84,43 +109,24 @@ fn prune(mut db vsql.Connection, config Config, log fn (string)) !PruneStats {
 		}
 	}
 
-	remove := p.remove
-	freed := p.freed
-	if remove.len == 0 {
-		return PruneStats{}
-	}
+	return p
+}
 
-	mut result := PruneStats{
-		versions: remove.len
-		objects:  freed.len
-	}
+fn delete_pruned(mut db vsql.Connection, p Pruner) ! {
 	db.query('START TRANSACTION')!
 	mut delete_file := db.prepare('DELETE FROM files WHERE id = ?')!
-	for r in remove {
+	for r in p.remove {
 		delete_file.query({
 			'?1': vsql.new_bigint_value(r.id)
 		})!
 	}
 	mut delete_object := db.prepare('DELETE FROM objects WHERE sha256 = ?')!
-	for sha in freed {
+	for sha in p.freed {
 		delete_object.query({
 			'?1': vsql.new_varchar_value(sha)
 		})!
-		result.bytes += stored_sizes[sha]
 	}
 	db.query('COMMIT')!
-
-	for sha in freed {
-		path := object_path(config.destination, sha)
-		os.rm(path) or {}
-		// Remove the AB/CD folders when they're empty. os.rmdir fails if not.
-		os.rmdir(os.dir(path)) or {}
-		os.rmdir(os.dir(os.dir(path))) or {}
-	}
-	if result.versions > 0 {
-		log('pruned   ${result.versions} old versions, ${result.objects} objects, ${human_size(result.bytes)}')
-	}
-	return result
 }
 
 // Pruner tracks which versions are being removed and which objects that
@@ -132,6 +138,14 @@ mut:
 	total        i64 // stored bytes still in use
 	remove       []PruneRow
 	freed        []string
+}
+
+fn (p Pruner) freed_bytes() i64 {
+	mut n := i64(0)
+	for sha in p.freed {
+		n += p.stored_sizes[sha]
+	}
+	return n
 }
 
 fn (mut p Pruner) drop(r PruneRow) {

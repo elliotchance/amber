@@ -5,8 +5,7 @@ import os
 // Walker finds every file under the include paths that isn't excluded.
 struct Walker {
 	excludes []string
-	// skip is paths amber must never back up itself: the database (and its
-	// sidecar files) and the destination.
+	// skip is paths amber must never back up itself: the backup folder.
 	skip []string
 }
 
@@ -15,7 +14,7 @@ struct Walker {
 // path.
 fn (w Walker) is_excluded(path string) bool {
 	for s in w.skip {
-		if path == s || path.starts_with(s + '/') || path.starts_with(s + '.') {
+		if path == s || path.starts_with(s + '/') {
 			return true
 		}
 	}

@@ -1,7 +1,6 @@
 module main
 
 import os
-import compress.szip
 import elliotchance.vsql.vsql
 
 const day = i64(86_400_000_000)
@@ -19,20 +18,20 @@ fn new_env(name string) Env {
 	src := os.join_path(root, 'src')
 	dest := os.join_path(root, 'dest')
 	os.mkdir_all(src) or { panic(err) }
-	os.mkdir_all(dest) or { panic(err) }
+	// The backup folder is made by init.
+	backup_dir := os.join_path(os.real_path(root), 'backup')
 	return Env{
 		root: os.real_path(root)
 		src:  os.real_path(src)
-		dest: os.real_path(dest)
-		db:   os.join_path(os.real_path(root), 'amber.vsql')
+		dest: backup_dir
+		db:   backup_dir
 	}
 }
 
 fn (e Env) init(excludes []string) {
-	create_database(e.db, Config{
-		destination: e.dest
-		includes:    [e.src]
-		excludes:    excludes
+	create_database(e.dest, Config{
+		includes: [e.src]
+		excludes: excludes
 	}) or { panic(err) }
 }
 
@@ -48,7 +47,7 @@ fn (e Env) backup(now i64) BackupStats {
 }
 
 fn (e Env) rows(query string) []vsql.Row {
-	mut db := vsql.open(e.db) or { panic(err) }
+	mut db := vsql.open(db_file(e.dest)) or { panic(err) }
 	defer {
 		db.close()
 	}
@@ -62,7 +61,7 @@ fn (e Env) rows(query string) []vsql.Row {
 fn test_init_fails_if_file_exists() {
 	e := new_env('exists')
 	e.init([])
-	create_database(e.db, Config{ destination: e.dest, includes: [e.src] }) or {
+	create_database(e.dest, Config{ includes: [e.src] }) or {
 		assert err.msg().contains('already exists')
 		return
 	}
@@ -70,8 +69,9 @@ fn test_init_fails_if_file_exists() {
 }
 
 fn test_backup_needs_existing_file() {
-	backup('/nonexistent/amber.vsql', 0, fn (_ string) {}) or {
-		assert err.msg().contains('does not exist')
+	backup('/nonexistent', 0, fn (_ string) {}) or {
+		assert err.msg().contains('is not an amber backup folder')
+		assert exit_code(err) == 3
 		return
 	}
 	assert false
@@ -167,12 +167,11 @@ fn test_compression() {
 	assert zipped.get('STORED_SIZE')!.int_value() == os.file_size(stored)
 	assert os.file_size(stored) < u64(big.len)
 
-	mut z := szip.open(stored, .no_compression, .read_only)!
-	defer {
-		z.close()
-	}
-	z.open_entry_by_index(0)!
-	assert z.read_entry_bytes()!.bytestr() == big
+	out := os.join_path(e.root, 'unzipped')
+	restore_object(stored, 'ZIP', out)!
+	assert os.read_file(out)! == big
+	// The zip command's own tools can read it too.
+	assert os.execute('unzip -p ${stored}').output == big
 }
 
 fn test_excludes() {
@@ -328,22 +327,22 @@ fn test_set_limits() {
 	e := new_env('limits')
 	e.init([])
 	set_limits(e.db, 3, none)!
-	mut db := vsql.open(e.db)!
-	mut c := read_config(mut db)!
+	mut db := vsql.open(db_file(e.dest))!
+	mut c := read_config(mut db, e.dest)!
 	db.close()
 	assert c.max_versions == 3
 	assert c.max_size == unlimited
 
 	set_limits(e.db, none, 1 << 20)!
-	db = vsql.open(e.db)!
-	c = read_config(mut db)!
+	db = vsql.open(db_file(e.dest))!
+	c = read_config(mut db, e.dest)!
 	db.close()
 	assert c.max_versions == 3
 	assert c.max_size == 1 << 20
 
 	set_limits(e.db, unlimited, unlimited)!
-	db = vsql.open(e.db)!
-	c = read_config(mut db)!
+	db = vsql.open(db_file(e.dest))!
+	c = read_config(mut db, e.dest)!
 	db.close()
 	assert c.max_versions == unlimited
 	assert c.max_size == unlimited
@@ -440,4 +439,74 @@ fn test_max_size_stops_backup_cleanly() {
 	}
 	assert e.objects_on_disk().len == 4
 	assert e.versions('3.jpg') == [1]
+}
+
+fn test_exit_codes() {
+	assert exit_code(error('plain')) == 1
+	assert exit_code(at(.read_index, error('x'))) == 7
+	// The innermost stage wins.
+	assert exit_code(at(.write_index, at(.compress, error('x')))) == 11
+
+	mut failed := 0
+	e := new_env('codes')
+	e.init([])
+	create_database(e.dest, Config{ includes: [e.src] }) or {
+		failed++
+		assert exit_code(err) == 4
+	}
+	parse_max_size('lots') or {
+		failed++
+		assert exit_code(err) == 2
+	}
+	parse_local_time('soon') or {
+		failed++
+		assert exit_code(err) == 2
+	}
+	ls(e.dest, [e.src], 1 * day) or {
+		failed++
+		assert exit_code(err) == 20
+	}
+
+	big := 'compress me '.repeat(10_000)
+	a := e.write('a.txt', big)
+	e.backup(1 * day)
+	restore(e.dest, e.src, e.root, 1 * day, fn (_ string) {}) or {
+		failed++
+		assert exit_code(err) == 21
+	}
+
+	// A damaged object fails its checksum, a missing one is reported as missing.
+	sha := sha256_file(a)!
+	os.write_file(object_path(e.dest, sha), 'garbage')!
+	restore(e.dest, e.src, os.join_path(e.root, 'r1'), 1 * day, fn (_ string) {}) or {
+		failed++
+		assert exit_code(err) == 23 // it's not a ZIP anymore
+	}
+	os.rm(object_path(e.dest, sha))!
+	restore(e.dest, e.src, os.join_path(e.root, 'r2'), 1 * day, fn (_ string) {}) or {
+		failed++
+		assert exit_code(err) == 22
+	}
+
+	set_limits(e.dest, none, 10)!
+	e.write('b.txt', big + big)
+	backup(e.dest, 2 * day, fn (_ string) {}) or {
+		failed++
+		assert exit_code(err) == 13
+	}
+	assert failed == 8
+}
+
+fn test_checksum_mismatch() {
+	e := new_env('checksum')
+	e.init([])
+	a := e.write('a.jpg', 'x'.repeat(10_000))
+	e.backup(1 * day)
+	// Same size, different content: only the checksum can catch it.
+	os.write_file(object_path(e.dest, sha256_file(a)!), 'y'.repeat(10_000))!
+	restore(e.dest, e.src, os.join_path(e.root, 'out'), 1 * day, fn (_ string) {}) or {
+		assert exit_code(err) == 24
+		return
+	}
+	assert false
 }

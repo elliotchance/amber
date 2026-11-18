@@ -14,8 +14,8 @@ mut:
 // A file is listed by itself. A folder lists the files and folders directly in
 // it, where a folder's size is the total of everything under it and its
 // modified time is the latest of them.
-fn ls(db_path string, paths []string, as_of i64) ![]string {
-	mut db := open_database(db_path)!
+fn ls(dir string, paths []string, as_of i64) ![]string {
+	mut db := open_database(dir)!
 	defer {
 		db.close()
 	}
@@ -51,7 +51,7 @@ fn ls(db_path string, paths []string, as_of i64) ![]string {
 			entries[name] = e
 		}
 		if entries.len == 0 {
-			return error('${arg}: not in the backup')
+			return stage_error(.not_found, '${arg}: not in the backup')
 		}
 
 		if paths.len > 1 {
@@ -81,8 +81,10 @@ fn parse_local_time(s string) !i64 {
 		10 { s + ' 23:59:59' }
 		16 { s + ':59' }
 		19 { s }
-		else { return error('invalid time "${s}", use YYYY-MM-DD [HH:MM[:SS]]') }
+		else { return stage_error(.usage, 'invalid time "${s}", use YYYY-MM-DD [HH:MM[:SS]]') }
 	}
-	t := time.parse(full) or { return error('invalid time "${s}", use YYYY-MM-DD [HH:MM[:SS]]') }
+	t := time.parse(full) or {
+		return stage_error(.usage, 'invalid time "${s}", use YYYY-MM-DD [HH:MM[:SS]]')
+	}
 	return local_to_unix(t) * 1_000_000 + 999_999
 }

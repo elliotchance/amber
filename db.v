@@ -7,9 +7,9 @@ import elliotchance.vsql.vsql
 const schema = [
 	// max_versions is how many previous versions of each path are kept, and
 	// max_size is the most bytes the stored objects can use. NULL means
-	// unlimited.
+	// unlimited. The backup folder itself isn't stored, it's wherever db.vsql
+	// is, so the folder can be moved or mounted somewhere else.
 	'CREATE TABLE config (
-		destination VARCHAR(4096) NOT NULL,
 		max_versions INTEGER CHECK (max_versions >= 0),
 		max_size BIGINT CHECK (max_size >= 0)
 	)',
@@ -17,8 +17,8 @@ const schema = [
 		kind VARCHAR(7) NOT NULL CHECK (kind IN ('include', 'exclude')),
 		glob VARCHAR(4096) NOT NULL
 	)",
-	// objects holds one row for each file stored in the destination, at
-	// destination/AB/CD/SHA256. Many files (or versions of a file) can share
+	// objects holds one row for each file stored in the backup folder, at
+	// AB/CD/SHA256. Many files (or versions of a file) can share
 	// the same object.
 	"CREATE TABLE objects (
 		sha256 VARCHAR(64) NOT NULL PRIMARY KEY,
@@ -47,7 +47,7 @@ const schema = [
 const unlimited = i64(-1)
 
 struct Config {
-	destination  string
+	dir          string // the backup folder, which holds db.vsql and the objects
 	includes     []string
 	excludes     []string
 	max_versions i64 = unlimited
@@ -64,21 +64,21 @@ struct FileVersion {
 	deleted  bool
 }
 
-fn create_database(path string, config Config) ! {
-	if os.exists(path) {
-		return error('${path} already exists')
-	}
-
-	write_schema(path, config) or {
-		remove_database(path)
-		return err
-	}
+// db_file is the index inside a backup folder.
+fn db_file(dir string) string {
+	return os.join_path(dir, 'db.vsql')
 }
 
-// remove_database removes path and the files vsql keeps next to it.
-fn remove_database(path string) {
-	for suffix in ['', '.wal', '.session', '.isolation', '.isolation.queue'] {
-		os.rm(path + suffix) or {}
+// create_database creates the backup folder dir, which must not exist yet,
+// and the index inside it. The folder is removed again if anything fails.
+fn create_database(dir string, config Config) ! {
+	if os.exists(dir) {
+		return stage_error(.index_exists, '${dir} already exists')
+	}
+	os.mkdir_all(dir) or { return at(.create_index, err) }
+	write_schema(db_file(dir), config) or {
+		os.rmdir_all(dir) or {}
+		return at(.create_index, err)
 	}
 }
 
@@ -93,12 +93,10 @@ fn write_schema(path string, config Config) ! {
 		db.query(statement)!
 	}
 
-	mut stmt := db.prepare('INSERT INTO config (destination, max_versions, max_size)
-		VALUES (?, ?, ?)')!
+	mut stmt := db.prepare('INSERT INTO config (max_versions, max_size) VALUES (?, ?)')!
 	stmt.query({
-		'?1': vsql.new_varchar_value(config.destination)
-		'?2': limit_value(config.max_versions, .integer)
-		'?3': limit_value(config.max_size, .bigint)
+		'?1': limit_value(config.max_versions, .integer)
+		'?2': limit_value(config.max_size, .bigint)
 	})!
 
 	mut pattern_stmt := db.prepare('INSERT INTO patterns (kind, glob) VALUES (?, ?)')!
@@ -117,19 +115,21 @@ fn write_schema(path string, config Config) ! {
 	db.query('COMMIT')!
 }
 
-fn open_database(path string) !&vsql.Connection {
-	if !os.exists(path) {
-		return error('${path} does not exist, run "amber init -f ${path}" to create it')
+fn open_database(dir string) !&vsql.Connection {
+	if !os.exists(db_file(dir)) {
+		return stage_error(.index_missing, '${dir} is not an amber backup folder (it has no db.vsql), create one with "amber init -d ..."')
 	}
-	return vsql.open(path)!
+	return vsql.open(db_file(dir)) or { return at(.open_index, err) }
 }
 
-fn read_config(mut db vsql.Connection) !Config {
-	mut destination := ''
+fn read_config(mut db vsql.Connection, dir string) !Config {
+	return read_config_rows(mut db, dir) or { return at(.read_index, err) }
+}
+
+fn read_config_rows(mut db vsql.Connection, dir string) !Config {
 	mut max_versions := unlimited
 	mut max_size := unlimited
-	for row in db.query('SELECT destination, max_versions, max_size FROM config')! {
-		destination = row.get_string('DESTINATION')!
+	for row in db.query('SELECT max_versions, max_size FROM config')! {
 		if !row.get_null('MAX_VERSIONS')! {
 			max_versions = row.get('MAX_VERSIONS')!.int_value()
 		}
@@ -150,7 +150,7 @@ fn read_config(mut db vsql.Connection) !Config {
 	}
 
 	return Config{
-		destination:  destination
+		dir:          os.real_path(dir)
 		includes:     includes
 		excludes:     excludes
 		max_versions: max_versions
@@ -159,11 +159,15 @@ fn read_config(mut db vsql.Connection) !Config {
 }
 
 // set_limits changes max_versions and max_size. none leaves a limit as it is.
-fn set_limits(db_path string, max_versions ?i64, max_size ?i64) ! {
-	mut db := open_database(db_path)!
+fn set_limits(dir string, max_versions ?i64, max_size ?i64) ! {
+	mut db := open_database(dir)!
 	defer {
 		db.close()
 	}
+	update_limits(mut db, max_versions, max_size) or { return at(.write_index, err) }
+}
+
+fn update_limits(mut db vsql.Connection, max_versions ?i64, max_size ?i64) ! {
 	if v := max_versions {
 		mut stmt := db.prepare('UPDATE config SET max_versions = ?')!
 		stmt.query({
@@ -194,6 +198,10 @@ fn limit_value(v i64, typ LimitType) vsql.Value {
 // exactly prefix or under prefix (an empty prefix is every path), only counting
 // rows backed up at or before as_of (microseconds since the UNIX epoch).
 fn latest_versions(mut db vsql.Connection, prefix string, as_of i64) !map[string]FileVersion {
+	return latest_version_rows(mut db, prefix, as_of) or { return at(.read_index, err) }
+}
+
+fn latest_version_rows(mut db vsql.Connection, prefix string, as_of i64) !map[string]FileVersion {
 	mut result := map[string]FileVersion{}
 	as_of_value := vsql.new_timestamp_value(us_to_timestamp(as_of))!
 	mut rows := if prefix == '' {
@@ -241,11 +249,27 @@ fn latest_versions(mut db vsql.Connection, prefix string, as_of i64) !map[string
 
 // known_objects returns the compression of every stored object.
 fn known_objects(mut db vsql.Connection) !map[string]string {
+	return known_object_rows(mut db) or { return at(.read_index, err) }
+}
+
+fn known_object_rows(mut db vsql.Connection) !map[string]string {
 	mut result := map[string]string{}
 	for row in db.query('SELECT sha256, compression FROM objects')! {
 		result[row.get_string('SHA256')!] = row.get_string('COMPRESSION')!
 	}
 	return result
+}
+
+// stored_total is how many bytes the objects use.
+fn stored_total(mut db vsql.Connection) !i64 {
+	return stored_total_row(mut db) or { return at(.read_index, err) }
+}
+
+fn stored_total_row(mut db vsql.Connection) !i64 {
+	for row in db.query('SELECT COALESCE(SUM(stored_size), 0) AS total FROM objects')! {
+		return row.get('TOTAL')!.int_value()
+	}
+	return 0
 }
 
 // us_to_timestamp formats microseconds since the UNIX epoch as a TIMESTAMP(6)

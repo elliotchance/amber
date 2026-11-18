@@ -7,9 +7,9 @@ fn parse_max_versions(s string) !i64 {
 	if s == 'unlimited' {
 		return unlimited
 	}
-	n := strconv.atoi(s) or { return error('invalid max versions "${s}", use a number or "unlimited"') }
+	n := strconv.atoi(s) or { return stage_error(.usage, 'invalid max versions "${s}", use a number or "unlimited"') }
 	if n < 0 {
-		return error('invalid max versions "${s}", use a number or "unlimited"')
+		return stage_error(.usage, 'invalid max versions "${s}", use a number or "unlimited"')
 	}
 	return n
 }
@@ -20,7 +20,7 @@ fn parse_max_size(s string) !i64 {
 	if s == 'unlimited' {
 		return unlimited
 	}
-	invalid := error('invalid max size "${s}", use a size like 500G or "unlimited"')
+	invalid := stage_error(.usage, 'invalid max size "${s}", use a size like 500G or "unlimited"')
 	mut number := s.to_upper().trim_right('B').trim_right('I')
 	mut multiplier := i64(1)
 	if number.len > 0 {
