@@ -3,12 +3,19 @@ module main
 import os
 import crypto.sha256
 
-// Files with these extensions are already compressed, so they're stored as is.
-const compressed_extensions = ['.7z', '.aac', '.apk', '.avi', '.br', '.bz2', '.cab', '.dmg', '.docx',
-	'.epub', '.flac', '.gif', '.gz', '.heic', '.heif', '.jar', '.jpeg', '.jpg', '.lz', '.lz4',
-	'.lzma', '.m4a', '.m4v', '.mkv', '.mov', '.mp3', '.mp4', '.odp', '.ods', '.odt', '.ogg', '.opus',
-	'.png', '.pptx', '.rar', '.tbz', '.tgz', '.txz', '.webm', '.webp', '.xlsx', '.xz', '.zip',
-	'.zst']
+// default_no_compress is the no_compress patterns of a new backup: formats
+// that are already compressed, so compressing them again wastes time.
+const default_no_compress = ['*.7z', '*.aac', '*.apk', '*.avi', '*.br', '*.bz2', '*.cab', '*.dmg',
+	'*.docx', '*.epub', '*.flac', '*.gif', '*.gz', '*.heic', '*.heif', '*.jar', '*.jpeg', '*.jpg',
+	'*.lz', '*.lz4', '*.lzma', '*.m4a', '*.m4v', '*.mkv', '*.mov', '*.mp3', '*.mp4', '*.odp', '*.ods',
+	'*.odt', '*.ogg', '*.opus', '*.png', '*.pptx', '*.rar', '*.tbz', '*.tgz', '*.txz', '*.webm',
+	'*.webp', '*.xlsx', '*.xz', '*.zip', '*.zst']
+
+// StoreOptions decide how chunks are stored.
+struct StoreOptions {
+	blksize     i64      // the block size of the backup folder
+	no_compress []string // patterns of files that are stored as is
+}
 
 const hash_buffer_size = 1 << 20
 
@@ -34,20 +41,20 @@ fn object_path(dir string, sha string) string {
 }
 
 // should_compress is true unless the chunk is smaller than a block (it can't
-// use less space) or comes from a file that's already compressed. A zipped
-// chunk is still only kept if it's smaller.
-fn should_compress(path string, size i64, blksize i64) bool {
-	if size < blksize {
+// use less space) or its file matches a no_compress pattern (ignoring case). A
+// zipped chunk is still only kept if it's smaller.
+fn should_compress(path string, size i64, opts StoreOptions) bool {
+	if size < opts.blksize {
 		return false
 	}
-	return os.file_ext(path).to_lower() !in compressed_extensions
+	return !matches_any(path.to_lower(), opts.no_compress.map(it.to_lower()))
 }
 
 // encode_chunk returns the bytes to store for a chunk and their compression.
 // Chunks are at most max_chunk, so this happens in memory. A compressed chunk
 // is a standard ZIP archive with one entry, so `unzip -p` can read it.
-fn encode_chunk(path string, sha string, chunk []u8, blksize i64) !([]u8, string) {
-	if should_compress(path, chunk.len, blksize) {
+fn encode_chunk(path string, sha string, chunk []u8, opts StoreOptions) !([]u8, string) {
+	if should_compress(path, chunk.len, opts) {
 		if compressed := deflate_smaller(chunk) {
 			zipped := zip_single_entry(sha, chunk, compressed)
 			if zipped.len < chunk.len {

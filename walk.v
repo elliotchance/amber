@@ -18,8 +18,15 @@ fn (w Walker) is_excluded(path string) bool {
 			return true
 		}
 	}
+	return matches_any(path, w.excludes)
+}
+
+// matches_any is true if path matches one of patterns. A pattern without a
+// "/" is matched against the file or folder name, otherwise it's matched
+// against the full path.
+fn matches_any(path string, patterns []string) bool {
 	name := os.base(path)
-	for pattern in w.excludes {
+	for pattern in patterns {
 		if pattern.contains('/') {
 			if path.match_glob(pattern) {
 				return true

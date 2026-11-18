@@ -13,6 +13,7 @@ enum Stage {
 	open_index     = 6
 	read_index     = 7
 	write_index    = 8
+	index_newer    = 9 // the index was made by a newer amber
 	read_source    = 10 // a file to back up couldn't be read or hashed
 	compress       = 11
 	write_object   = 12
@@ -23,6 +24,8 @@ enum Stage {
 	decompress     = 23
 	checksum       = 24
 	write_target   = 25
+	deleted        = 26 // the path was deleted at that time
+	fsck           = 30 // fsck found problems
 }
 
 struct StageError {

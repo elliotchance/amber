@@ -242,10 +242,10 @@ fn test_restore() {
 	assert os.read_file(os.join_path(target, 'dir', 'b.txt'))! == 'tiny'
 	assert file_stat(os.join_path(target, 'a.txt'))!.mtime_us == 1_700_000_000_123_456
 
-	// A file goes into the target under its own name.
-	target2 := os.join_path(e.root, 'out2')
+	// A file's target is the restored file.
+	target2 := os.join_path(e.root, 'a-copy.txt')
 	assert restore(e.db, a, target2, 2 * day, fn (_ string) {})! == 1
-	assert os.read_file(os.join_path(target2, 'a.txt'))! == 'newer'
+	assert os.read_file(target2)! == 'newer'
 
 	restore(e.db, e.src, target, 2 * day, fn (_ string) {}) or {
 		assert err.msg().contains('already exists')
@@ -393,8 +393,13 @@ fn test_max_size_prunes_oldest_previous_versions() {
 	e.backup(3 * day)
 	assert e.objects_on_disk().len == 4
 
-	// Only the oldest previous version (a.jpg v1) has to go to fit 3000 bytes.
+	// By default min versions is unlimited, so nothing is removed for space.
 	set_limits(e.db, none, 3000)!
+	assert e.backup(4 * day).pruned == 0
+	assert e.objects_on_disk().len == 4
+
+	// Only the oldest previous version (a.jpg v1) has to go to fit 3000 bytes.
+	set_min_versions(e.db, 0)!
 	assert e.backup(4 * day).pruned == 1
 	assert e.versions('a.jpg') == [2]
 	assert e.versions('b.jpg') == [1, 2]
@@ -661,4 +666,259 @@ fn test_max_size_mid_file_leaves_nothing() {
 		return
 	}
 	assert false
+}
+
+fn test_restore_defaults_to_the_current_folder() {
+	e := new_env('restore_cwd')
+	e.init([])
+	e.write('a.txt', 'one')
+	e.write('docs/b.txt', 'two')
+	e.backup(1 * day)
+
+	old := os.getwd()
+	work := os.join_path(e.root, 'work')
+	os.mkdir_all(work)!
+	os.chdir(work)!
+	defer {
+		os.chdir(old) or {}
+	}
+
+	assert restore(e.dest, os.join_path(e.src, 'a.txt'), '', 1 * day, fn (_ string) {})! == 1
+	assert os.read_file(os.join_path(work, 'a.txt'))! == 'one'
+	assert restore(e.dest, os.join_path(e.src, 'docs'), '', 1 * day, fn (_ string) {})! == 1
+	assert os.read_file(os.join_path(work, 'docs', 'b.txt'))! == 'two'
+
+	// Both already exist now.
+	restore(e.dest, os.join_path(e.src, 'a.txt'), '', 1 * day, fn (_ string) {}) or {
+		assert exit_code(err) == 21
+		assert err.msg().contains('a.txt already exists')
+		return
+	}
+	assert false
+}
+
+fn test_restore_deleted_shows_command() {
+	e := new_env('restore_deleted')
+	e.init([])
+	path := e.write('a.txt', 'one')
+	e.backup(1 * day)
+	os.rm(path)!
+	e.backup(2 * day)
+
+	out := os.join_path(e.root, 'out.txt')
+	restore(e.dest, path, out, 3 * day, fn (_ string) {}) or {
+		assert exit_code(err) == 26
+		msg := err.msg()
+		assert msg.contains('a.txt was deleted at ${format_local(2 * day)}')
+		command := msg.all_after('\n\n  ')
+		assert command == "amber restore -d ${e.dest} -t '${format_local(2 * day - 1_000_000)}' ${path} ${out}"
+
+		// The suggested time works.
+		t := parse_local_time(command.all_after("-t '").all_before("'"))!
+		assert restore(e.dest, path, out, t, fn (_ string) {})! == 1
+		assert os.read_file(out)! == 'one'
+		return
+	}
+	assert false
+}
+
+fn test_restore_deleted_folder() {
+	e := new_env('restore_deleted_dir')
+	e.init([])
+	e.write('docs/a.txt', 'a')
+	b := e.write('docs/b.txt', 'b')
+	e.backup(1 * day)
+	os.rm(os.join_path(e.src, 'docs', 'a.txt'))!
+	e.backup(2 * day)
+	os.rm(b)!
+	e.backup(3 * day)
+
+	// The folder existed until b.txt was deleted, and just before that it
+	// only had b.txt (a.txt was deleted earlier).
+	restore(e.dest, os.join_path(e.src, 'docs'), '', 4 * day, fn (_ string) {}) or {
+		assert exit_code(err) == 26
+		assert err.msg().contains('was deleted at ${format_local(3 * day)}')
+		t := parse_local_time(err.msg().all_after("-t '").all_before("'"))!
+		out := os.join_path(e.root, 'docs-out')
+		assert restore(e.dest, os.join_path(e.src, 'docs'), out, t, fn (_ string) {})! == 1
+		assert os.ls(out)! == ['b.txt']
+		return
+	}
+	assert false
+}
+
+fn test_restore_never_backed_up() {
+	e := new_env('restore_missing')
+	e.init([])
+	e.write('a.txt', 'a')
+	e.backup(1 * day)
+	restore(e.dest, os.join_path(e.src, 'nope.txt'), '', 2 * day, fn (_ string) {}) or {
+		assert exit_code(err) == 20
+		return
+	}
+	assert false
+}
+
+fn test_keep_deleted() {
+	e := new_env('keep_deleted')
+	e.init([])
+	a := e.write('a.jpg', 'a'.repeat(1000))
+	e.write('b.jpg', 'b'.repeat(1000))
+	e.backup(1 * day)
+	e.write('a.jpg', 'A'.repeat(1000))
+	e.backup(2 * day)
+	os.rm(a)!
+	e.backup(3 * day)
+	assert e.versions('a.jpg') == [1, 2, 3]
+
+	parse_keep_deleted('soon') or { assert exit_code(err) == 2 }
+	assert parse_keep_deleted('forever')! == unlimited
+	set_keep_deleted(e.dest, 2)!
+
+	// Deleted at day 3, so it's kept until day 5.
+	e.backup(4 * day)
+	assert e.versions('a.jpg') == [1, 2, 3]
+	assert e.backup(5 * day).pruned == 3
+	assert e.versions('a.jpg') == []
+	assert e.versions('b.jpg') == [1]
+	assert e.objects_on_disk().len == 1
+
+	set_keep_deleted(e.dest, unlimited)!
+	mut db := vsql.open(db_file(e.dest))!
+	assert read_config(mut db, e.dest)!.keep_deleted == unlimited
+	db.close()
+}
+
+fn test_index_version() {
+	e := new_env('version')
+	e.init([])
+	mut db := open_database(e.dest)!
+	assert index_version(mut db)! == schema_version
+	db.query('UPDATE config SET version = ${schema_version + 1}')!
+	db.close()
+
+	open_database(e.dest) or {
+		assert exit_code(err) == 9
+		assert err.msg().contains('made by a newer amber')
+		return
+	}
+	assert false
+}
+
+fn test_min_versions_limits_max_size() {
+	e := new_env('min_versions')
+	e.init([])
+	for i in 1 .. 5 {
+		e.write('a.jpg', '${i}'.repeat(1000))
+		e.backup(i * day)
+	}
+	assert e.versions('a.jpg') == [1, 2, 3, 4]
+
+	// Far over the limit, but one previous version always stays.
+	set_limits(e.dest, none, 100)!
+	set_min_versions(e.dest, 1)!
+	assert e.backup(5 * day).pruned == 2
+	assert e.versions('a.jpg') == [3, 4]
+
+	check_versions(1, 5)!
+	check_versions(unlimited, 5)!
+	check_versions(5, unlimited)!
+	check_versions(6, 5) or {
+		assert exit_code(err) == 2
+		return
+	}
+	assert false
+}
+
+fn test_cleanup() {
+	e := new_env('cleanup')
+	e.init([])
+	for i in 1 .. 4 {
+		e.write('a.jpg', '${i}'.repeat(1000))
+		e.backup(i * day)
+	}
+	assert cleanup(e.dest, 4 * day, fn (_ string) {})!.versions == 0
+	set_limits(e.dest, 1, none)!
+	result := cleanup(e.dest, 4 * day, fn (_ string) {})!
+	assert result.versions == 1
+	assert result.objects == 1
+	assert e.versions('a.jpg') == [2, 3]
+	assert cleanup(e.dest, 4 * day, fn (_ string) {})!.versions == 0
+}
+
+fn test_no_compress_patterns() {
+	e := new_env('no_compress')
+	create_database(e.dest, Config{
+		includes:    [e.src]
+		no_compress: no_compress_list(default_no_compress, ['/*/raw/*'], ['*.zip'])!
+	})!
+	big := 'compress me '.repeat(10_000)
+	e.write('a.txt', big)
+	e.write('b.ZIP', big + '1') // no longer in the list
+	e.write('c.MP3', big + '2') // case is ignored
+	e.write('raw/d.txt', big + '3') // the whole folder
+	e.backup(1 * day)
+
+	compression := fn [e] (name string) string {
+		return e.rows("SELECT o.compression FROM objects o JOIN files f ON f.sha256 = o.sha256
+			WHERE f.path = '${os.join_path(e.src, name)}'")[0].get_string('COMPRESSION') or { '' }
+	}
+	assert compression('a.txt') == 'ZIP'
+	assert compression('b.ZIP') == 'ZIP'
+	assert compression('c.MP3') == 'NONE'
+	assert compression('raw/d.txt') == 'NONE'
+
+	// Changing the list only affects new chunks.
+	change_no_compress(e.dest, ['*.txt'], [])!
+	e.write('e.txt', big + '4')
+	e.backup(2 * day)
+	assert compression('a.txt') == 'ZIP'
+	assert compression('e.txt') == 'NONE'
+
+	mut db := open_database(e.dest)!
+	patterns := read_config(mut db, e.dest)!.no_compress
+	db.close()
+	assert '*.txt' in patterns && '*.mp3' in patterns && '*.zip' !in patterns
+
+	change_no_compress(e.dest, [], ['*.nope']) or {
+		assert exit_code(err) == 2
+		return
+	}
+	assert false
+}
+
+fn test_wrap_list() {
+	assert wrap_list('X: ', [], 20) == 'X: (none)'
+	assert wrap_list('X: ', ['aaaa', 'bbbb', 'cccc', 'dddd'], 15) == 'X: aaaa bbbb\n   cccc dddd'
+}
+
+fn test_fsck() {
+	e := new_env('fsck')
+	e.init([])
+	data := random_bytes(6 << 20, 7)
+	e.write('big.bin', data.bytestr())
+	a := e.write('a.txt', 'compress me '.repeat(10_000))
+	e.backup(1 * day)
+	assert fsck(e.dest, true, fn (_ string) {})!.problems == []
+
+	// Damage the same size: only --hash notices.
+	sha := sha256_file(a)!
+	obj := object_path(e.dest, sha)
+	mut stored := os.read_bytes(obj)!
+	stored[stored.len / 2] ^= 0xff
+	os.write_file_array(obj, stored)!
+	assert fsck(e.dest, false, fn (_ string) {})!.problems == []
+	assert fsck(e.dest, true, fn (_ string) {})!.problems.len == 1
+
+	// A missing object, a stray file and a leftover temporary file.
+	os.rm(obj)!
+	stray := '00'.repeat(32)
+	os.mkdir_all(os.join_path(e.dest, '00', '00'))!
+	os.write_file(os.join_path(e.dest, '00', '00', stray), 'x')!
+	os.write_file(os.join_path(e.dest, '00', '00', stray + '.tmp'), 'x')!
+	problems := fsck(e.dest, false, fn (_ string) {})!.problems
+	assert problems.len == 3, problems.str()
+	assert problems.any(it.contains('${sha} is missing'))
+	assert problems.any(it.contains('${stray} is not in the index'))
+	assert problems.any(it.contains('temporary file'))
 }

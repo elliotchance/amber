@@ -24,12 +24,15 @@ fn backup(dir string, now i64, log fn (string)) !BackupStats {
 
 	config := read_config(mut db, dir)!
 	mut result := BackupStats{}
-	result.pruned += prune(mut db, config, log)!.versions
+	result.pruned += prune(mut db, config, now, log)!.versions
 	latest := latest_versions(mut db, '', now)!
 	mut objects := known_objects(mut db)!
 	mut manifests := known_manifests(mut db)!
 	mut total := stored_total(mut db)!
-	blksize := block_size(config.dir)
+	opts := StoreOptions{
+		blksize:     block_size(config.dir)
+		no_compress: config.no_compress
+	}
 
 	walker := Walker{
 		excludes: config.excludes
@@ -61,7 +64,7 @@ fn backup(dir string, now i64, log fn (string)) !BackupStats {
 		// points at a missing chunk. The chunks of at most one file can be left
 		// without rows, and the next backup records them.
 		room := if config.max_size == unlimited { unlimited } else { config.max_size - total }
-		file := store_file(path, config.dir, objects, room, blksize) or {
+		file := store_file(path, config.dir, objects, room, opts) or {
 			if err is StageError && err.stage == .read_source {
 				log('skipped  ${path}: ${err.msg()}')
 				result.skipped++
@@ -103,7 +106,7 @@ fn backup(dir string, now i64, log fn (string)) !BackupStats {
 	}
 
 	w.commit() or { return at(.write_index, err) }
-	result.pruned += prune(mut db, config, log)!.versions
+	result.pruned += prune(mut db, config, now, log)!.versions
 	return result
 }
 
@@ -130,9 +133,9 @@ mut:
 // already in the index, and room is how many more bytes can be stored. If
 // anything fails, the chunks it wrote are removed again (no row refers to
 // them yet).
-fn store_file(path string, dir string, objects map[string]string, room i64, blksize i64) !StoredFile {
+fn store_file(path string, dir string, objects map[string]string, room i64, opts StoreOptions) !StoredFile {
 	mut file := StoredFile{}
-	store_chunks(path, dir, objects, room, blksize, mut file) or {
+	store_chunks(path, dir, objects, room, opts, mut file) or {
 		for o in file.new_objects {
 			remove_object(dir, o.sha)
 		}
@@ -141,7 +144,7 @@ fn store_file(path string, dir string, objects map[string]string, room i64, blks
 	return file
 }
 
-fn store_chunks(path string, dir string, objects map[string]string, room i64, blksize i64, mut file StoredFile) ! {
+fn store_chunks(path string, dir string, objects map[string]string, room i64, opts StoreOptions, mut file StoredFile) ! {
 	mut c := new_chunker(path) or { return at(.read_source, err) }
 	defer {
 		c.close()
@@ -160,7 +163,7 @@ fn store_chunks(path string, dir string, objects map[string]string, room i64, bl
 			continue
 		}
 
-		data, compression := encode_chunk(path, sha, chunk, blksize) or {
+		data, compression := encode_chunk(path, sha, chunk, opts) or {
 			return at(.compress, err)
 		}
 		check_room(path, file.new_bytes + data.len, room)!

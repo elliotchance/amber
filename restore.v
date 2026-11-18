@@ -5,14 +5,11 @@ import crypto.sha256
 import elliotchance.vsql.vsql
 
 // restore copies path, as it was at as_of (microseconds since the UNIX epoch),
-// into target, which must not exist yet. A folder's contents go directly into
-// target, and a file goes into target under its own name. Each restored file
-// is checked against its SHA-256 and gets back its modified time.
-fn restore(dir string, path_arg string, target string, as_of i64, log fn (string)) !int {
-	if os.exists(target) {
-		return stage_error(.target_exists, '${target} already exists')
-	}
-
+// to target. A folder becomes the folder target, and a file becomes the file
+// target. An empty target is path's name in the current folder. target must
+// not exist yet. Each restored file is checked against its SHA-256 and gets
+// back its modified time.
+fn restore(dir string, path_arg string, target_arg string, as_of i64, log fn (string)) !int {
 	mut db := open_database(dir)!
 	defer {
 		db.close()
@@ -23,11 +20,11 @@ fn restore(dir string, path_arg string, target string, as_of i64, log fn (string
 	path := os.abs_path(path_arg).trim_right('/')
 	versions := latest_versions(mut db, path, as_of)!
 
-	// Relative path in target => version.
+	// Relative path in target => version. A file is "".
 	mut files := map[string]FileVersion{}
 	if v := versions[path] {
 		if !v.deleted {
-			files[os.base(path)] = v
+			files[''] = v
 		}
 	}
 	if files.len == 0 {
@@ -38,22 +35,52 @@ fn restore(dir string, path_arg string, target string, as_of i64, log fn (string
 		}
 	}
 	if files.len == 0 {
+		info := deleted_info(mut db, path, as_of)!
+		if info.found {
+			return stage_error(.deleted, '${path_arg} was deleted at ${format_local(info.deleted_at)}. To restore it as it was just before then, run:\n\n  ${restore_command(dir, path_arg, target_arg, info.before)}')
+		}
 		return stage_error(.not_found, '${path_arg}: not in the backup')
 	}
 
-	os.mkdir_all(target) or { return at(.write_target, err) }
+	target := if target_arg == '' { os.join_path(os.getwd(), os.base(path)) } else { target_arg }
+	if os.exists(target) {
+		return stage_error(.target_exists, '${target} already exists')
+	}
+
 	mut rels := files.keys()
 	rels.sort()
 	for rel in rels {
 		v := files[rel]
-		out := os.join_path(target, rel)
+		out := if rel == '' { target } else { os.join_path(target, rel) }
 		os.mkdir_all(os.dir(out)) or { return at(.write_target, err) }
-
 		restore_file(mut db, config.dir, objects, v, out)!
 		set_mtime(out, v.modified) or { return at(.write_target, err) }
 		log('restored ${out}')
 	}
 	return files.len
+}
+
+// restore_command is the restore command for the same arguments at a time
+// (microseconds since the UNIX epoch), as the user would type it.
+fn restore_command(dir string, path_arg string, target_arg string, at_time i64) string {
+	mut args := ['amber', 'restore']
+	if dir != '.' {
+		args << ['-d', shell_quote(dir)]
+	}
+	args << ['-t', shell_quote(format_local(at_time))]
+	args << shell_quote(path_arg)
+	if target_arg != '' {
+		args << shell_quote(target_arg)
+	}
+	return args.join(' ')
+}
+
+// shell_quote quotes s for a shell, only if it needs it.
+fn shell_quote(s string) string {
+	if s != '' && s.contains_only('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/._-~+=:,@') {
+		return s
+	}
+	return "'" + s.replace("'", "'\\''") + "'"
 }
 
 // restore_file writes the chunks of v to out, which must not exist yet. Each
