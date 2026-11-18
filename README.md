@@ -1,10 +1,31 @@
 # 🍯 amber
 
 A backup tool that keeps the full history of every file in a folder, like
-Time Machine. Written in [V](https://vlang.io) and stores its index in
-[vsql](https://github.com/elliotchance/vsql).
+Time Machine. Back up as often as you like and restore any file or folder as it
+was at any point in time.
 
-🚧 Work in progress.
+- **Every version is kept.** Each change or delete gets a new version number
+  for that path, so nothing is lost when a file is edited, deleted or recreated.
+- **Fast incremental backups.** Files whose size and modified time haven't
+  changed are skipped without being read.
+- **Deduplication.** Files are split into content-defined chunks and each chunk
+  is stored only once, so a small edit to a large file stores only the changed
+  part, and identical files cost nothing extra.
+- **Compression.** Chunks are zipped when that makes them smaller. Already
+  compressed formats are stored as is, and the list of patterns is
+  configurable.
+- **Restore by time.** List or restore any file or folder as it was at a given
+  time. Restoring something that was deleted then tells you the time to use.
+- **Limits and cleanup.** Cap the number of versions, the total size and how
+  long deleted files are kept. Old versions are only removed to make room when
+  you allow it.
+- **Safe.** Each file is committed in one transaction, so a backup that is
+  killed or runs out of space leaves a consistent backup that carries on next
+  time. `amber fsck` checks the index and the stored chunks agree.
+- **Portable.** A backup is one self-contained folder that can be moved or
+  mounted anywhere.
+- **Scriptable.** Every command exits with a code that says which stage
+  failed.
 
 ## Usage
 
@@ -212,7 +233,8 @@ older amber refuses an index made by a newer one (exit 9).
 
 ## Building
 
-Needs zlib (`libz`), which macOS has. On Linux install its headers (for
+amber is written in [V](https://vlang.io) and stores its index in
+[vsql](https://github.com/elliotchance/vsql). It also needs zlib (`libz`), which macOS has. On Linux install its headers (for
 example `zlib1g-dev`).
 
 ```sh
