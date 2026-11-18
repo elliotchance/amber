@@ -1028,3 +1028,7 @@ fn test_migrate_from_version_1() {
 	db.close()
 	assert e.backup(2 * day).unchanged == 1
 }
+
+fn test_version_line() {
+	assert version_line() == 'dev'
+}

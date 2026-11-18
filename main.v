@@ -63,6 +63,9 @@ const usage = 'usage:
   amber stats [-d folder]
       Show what is backed up and how much space it uses.
 
+  amber version
+      Show the version of amber and the date it was released.
+
 -d is the backup folder, which defaults to the current folder.
 
 exit codes (the stage that failed):
@@ -93,6 +96,7 @@ fn main() {
 		'ls' { cmd_ls(args) or { fail(err) } }
 		'restore' { cmd_restore(args) or { fail(err) } }
 		'stats' { cmd_stats(args) or { fail(err) } }
+		'version' { println(version_line()) }
 		else { exit_with_usage() }
 	}
 }

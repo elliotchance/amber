@@ -67,10 +67,13 @@ jobs:
         run: v test .
 
       # The zip has only the amber binary. Its name has no version, so that
-      # the newest one can always be downloaded from the same URL.
+      # the newest one can always be downloaded from the same URL. "amber
+      # version" shows the tag (or dev and the commit) and the commit's date.
       - name: Build
         run: |
-          v -prod -o amber .
+          if [ "$GITHUB_REF_TYPE" = tag ]; then version=$GITHUB_REF_NAME; else version=dev-$(git rev-parse --short HEAD); fi
+          v -prod -d amber_version="$version" -d amber_date="$(git log -1 --format=%cs)" -o amber .
+          ./amber version
           ./amber init -d "$RUNNER_TEMP/backup" --include "$PWD" --exclude .git
           ./amber backup -d "$RUNNER_TEMP/backup"
           ./amber fsck -d "$RUNNER_TEMP/backup" --hash

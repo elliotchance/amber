@@ -53,6 +53,12 @@ Linux (ARM64):
 curl -fsSL https://github.com/elliotchance/amber/releases/latest/download/amber-linux-arm64.zip -o /tmp/amber.zip && sudo unzip -o /tmp/amber.zip -d /usr/local/bin && rm /tmp/amber.zip
 ```
 
+`amber version` shows the version you have:
+
+```
+v1.2.3 2026-11-18
+```
+
 Existing backups are upgraded automatically the first time a new version
 opens them. A backup used by a newer amber can't be opened by an older one.
 
