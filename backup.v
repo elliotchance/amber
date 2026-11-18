@@ -2,10 +2,6 @@ module main
 
 import elliotchance.vsql.vsql
 
-// Changes are committed in batches, so an interrupted backup keeps most of its
-// work without paying for a commit per file.
-const commit_every = 100
-
 struct BackupStats {
 mut:
 	new       int
@@ -43,8 +39,6 @@ fn backup(dir string, now i64, log fn (string)) !BackupStats {
 
 	mut w := new_index_writer(mut db, now) or { return at(.write_index, err) }
 	mut seen := map[string]bool{}
-	mut pending := 0
-	w.begin() or { return at(.write_index, err) }
 
 	for path in paths {
 		seen[path] = true
@@ -64,26 +58,30 @@ fn backup(dir string, now i64, log fn (string)) !BackupStats {
 			result.skipped++
 			continue
 		}
-		if sha !in objects {
+		// Each file is one transaction: its object (if it's new) is written and
+		// renamed into place first, then its rows are committed together. If
+		// backup is killed, the index never points at a missing object. At most
+		// one object can be left without rows, and the next backup records it.
+		new_object := sha !in objects
+		mut stored_size := i64(0)
+		mut compression := objects[sha] or { '' }
+		if new_object {
 			room := if config.max_size == unlimited { unlimited } else { config.max_size - total }
-			stored_size, compression := store_object(path, sha, st.size, config.dir,
-				room) or {
-				// Keep everything backed up so far. Every committed version has
-				// its object, and the failed object was never written (or was
-				// removed), so running backup again carries on from here.
-				w.commit() or { return at(.write_index, err) }
+			stored_size, compression = store_object(path, sha, st.size, config.dir, room) or {
+				// Everything backed up so far is committed, and the failed
+				// object was never written (or was removed), so running backup
+				// again carries on from here.
 				stage := if err is StageError { err.stage } else { Stage.write_object }
 				return stage_error(stage, 'backup stopped: ${err.msg()}; ${result.new + result.changed} files were backed up before stopping')
 			}
-			total += stored_size
-			w.add_object(sha, st.size, stored_size, compression) or {
-				return at(.write_index, err)
-			}
-			objects[sha] = compression
 		}
 
-		w.add_version(path, prev.version + 1, st.size, st.mtime_us, sha) or {
+		w.add_file(path, prev.version + 1, st, sha, new_object, stored_size, compression) or {
 			return at(.write_index, err)
+		}
+		if new_object {
+			total += stored_size
+			objects[sha] = compression
 		}
 		if prev.version == 0 || prev.deleted {
 			log('new      ${path}')
@@ -92,17 +90,11 @@ fn backup(dir string, now i64, log fn (string)) !BackupStats {
 			log('changed  ${path}')
 			result.changed++
 		}
-
-		pending++
-		if pending >= commit_every {
-			w.commit() or { return at(.write_index, err) }
-			w.begin() or { return at(.write_index, err) }
-			pending = 0
-		}
 	}
 
 	mut gone := latest.keys().filter(!latest[it].deleted && it !in seen)
 	gone.sort()
+	w.begin() or { return at(.write_index, err) }
 	for path in gone {
 		w.add_delete(path, latest[path].version + 1) or { return at(.write_index, err) }
 		log('deleted  ${path}')
@@ -144,6 +136,24 @@ fn (mut w IndexWriter) begin() ! {
 
 fn (mut w IndexWriter) commit() ! {
 	w.db.query('COMMIT')!
+}
+
+// add_file records a new version of path (and its object, if it's new) in
+// one transaction.
+fn (mut w IndexWriter) add_file(path string, version int, st FileStat, sha string, new_object bool, stored_size i64, compression string) ! {
+	w.begin()!
+	w.write_file(path, version, st, sha, new_object, stored_size, compression) or {
+		w.db.query('ROLLBACK') or {}
+		return err
+	}
+	w.commit()!
+}
+
+fn (mut w IndexWriter) write_file(path string, version int, st FileStat, sha string, new_object bool, stored_size i64, compression string) ! {
+	if new_object {
+		w.add_object(sha, st.size, stored_size, compression)!
+	}
+	w.add_version(path, version, st.size, st.mtime_us, sha)!
 }
 
 fn (mut w IndexWriter) add_object(sha string, size i64, stored_size i64, compression string) ! {
