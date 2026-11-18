@@ -837,13 +837,13 @@ fn test_cleanup() {
 		e.write('a.jpg', '${i}'.repeat(1000))
 		e.backup(i * day)
 	}
-	assert cleanup(e.dest, 4 * day, fn (_ string) {})!.versions == 0
+	assert cleanup(e.dest, 4 * day, false, fn (_ string) {})!.versions == 0
 	set_limits(e.dest, 1, none)!
-	result := cleanup(e.dest, 4 * day, fn (_ string) {})!
+	result := cleanup(e.dest, 4 * day, false, fn (_ string) {})!
 	assert result.versions == 1
 	assert result.objects == 1
 	assert e.versions('a.jpg') == [2, 3]
-	assert cleanup(e.dest, 4 * day, fn (_ string) {})!.versions == 0
+	assert cleanup(e.dest, 4 * day, false, fn (_ string) {})!.versions == 0
 }
 
 fn test_no_compress_patterns() {
@@ -921,4 +921,110 @@ fn test_fsck() {
 	assert problems.any(it.contains('${sha} is missing'))
 	assert problems.any(it.contains('${stray} is not in the index'))
 	assert problems.any(it.contains('temporary file'))
+}
+
+fn test_changing_patterns_keeps_history() {
+	e := new_env('patterns')
+	e.init([])
+	e.write('keep/a.txt', 'a')
+	e.write('logs/b.log', 'b')
+	e.write('c.tmp', 'c')
+	e.backup(1 * day)
+
+	change_patterns(e.dest, PatternChanges{
+		add_excludes: ['*.tmp', 'logs']
+	})!
+	// Nothing changed on disk, and nothing is recorded as deleted.
+	stats := e.backup(2 * day)
+	assert stats.deleted == 0
+	assert stats.excluded == 2
+	assert stats.unchanged == 1
+	assert e.versions('logs/b.log') == [1]
+	assert e.versions('c.tmp') == [1]
+	// They can still be restored.
+	assert restore(e.dest, os.join_path(e.src, 'c.tmp'), os.join_path(e.root, 'c.tmp'),
+		2 * day, fn (_ string) {})! == 1
+
+	// Including them again carries on from where they were.
+	change_patterns(e.dest, PatternChanges{
+		remove_excludes: ['logs']
+	})!
+	stats2 := e.backup(3 * day)
+	assert stats2.excluded == 1
+	assert stats2.unchanged == 2
+
+	// cleanup --excluded removes the history of what's still excluded.
+	result := cleanup(e.dest, 4 * day, true, fn (_ string) {})!
+	assert result.versions == 1
+	assert e.versions('c.tmp') == []
+	assert e.versions('logs/b.log') == [1]
+}
+
+fn test_change_patterns_errors() {
+	e := new_env('pattern_errors')
+	e.init([])
+	other := os.join_path(e.root, 'other')
+	os.mkdir_all(other)!
+	change_patterns(e.dest, PatternChanges{
+		add_includes: [other]
+	})!
+	mut db := open_database(e.dest)!
+	assert read_config(mut db, e.dest)!.includes == [e.src, other]
+	db.close()
+
+	mut failed := 0
+	change_patterns(e.dest, PatternChanges{ remove_excludes: ['nope'] }) or {
+		assert exit_code(err) == 2
+		assert err.msg().contains('exclude "nope" is not in the list')
+		failed++
+	}
+	change_patterns(e.dest, PatternChanges{ remove_includes: [e.src, other] }) or {
+		assert exit_code(err) == 2
+		assert err.msg().contains('at least one include')
+		failed++
+	}
+	assert failed == 2
+}
+
+fn test_covers() {
+	w := Walker{
+		includes: ['/a', '/b/c']
+		excludes: ['*.tmp', 'skip', '/a/x/*']
+		skip:     ['/a/backup']
+	}
+	assert w.covers('/a/f.txt')
+	assert w.covers('/b/c/d/f.txt')
+	assert !w.covers('/b/f.txt')
+	assert !w.covers('/ab/f.txt')
+	assert !w.covers('/a/f.tmp')
+	assert !w.covers('/a/skip/f.txt')
+	assert !w.covers('/a/x/f.txt')
+	assert !w.covers('/a/backup/db.vsql')
+}
+
+fn test_migrate_from_version_1() {
+	e := new_env('migrate')
+	e.init(['*.tmp'])
+	e.write('a.txt', 'a')
+	e.backup(1 * day)
+
+	// Make it look like an index made by version 1 of the schema.
+	mut db := vsql.open(db_file(e.dest))!
+	db.query('ALTER TABLE patterns DROP COLUMN seq')!
+	db.query('UPDATE config SET version = 1')!
+	db.close()
+
+	db = open_database(e.dest)!
+	assert index_version(mut db)! == 2
+	config := read_config(mut db, e.dest)!
+	assert config.includes == [e.src]
+	assert config.excludes == ['*.tmp']
+	db.close()
+
+	// New patterns go after the migrated ones.
+	change_patterns(e.dest, PatternChanges{ add_excludes: ['*.log'] })!
+	db = open_database(e.dest)!
+	assert read_config(mut db, e.dest)!.excludes == ['*.tmp', '*.log']
+	db.close()
+	assert e.backup(2 * day).unchanged == 1
 }

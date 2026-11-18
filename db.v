@@ -8,7 +8,10 @@ import elliotchance.vsql.vsql
 // version 1 to 2, migrations[1] upgrades 2 to 3, and so on. Only ever append
 // to it. schema always creates the latest version, so a change to the
 // schema needs a migration that makes the same change to an existing index.
-const migrations = [][]string{}
+const migrations = [
+	// 1 to 2: patterns are kept in the order they were added.
+	['ALTER TABLE patterns ADD COLUMN seq INTEGER DEFAULT 0 NOT NULL'],
+]
 
 // schema_version is the version of the index this amber reads and writes.
 const schema_version = migrations.len + 1
@@ -34,9 +37,13 @@ const schema = [
 	'CREATE TABLE no_compress (
 		glob VARCHAR(4096) NOT NULL PRIMARY KEY
 	)',
+	// patterns are the includes and excludes, in the order they were added
+	// (seq). Includes are the paths to back up, and excludes are applied to
+	// everything found under them.
 	"CREATE TABLE patterns (
 		kind VARCHAR(7) NOT NULL CHECK (kind IN ('include', 'exclude')),
-		glob VARCHAR(4096) NOT NULL
+		glob VARCHAR(4096) NOT NULL,
+		seq INTEGER DEFAULT 0 NOT NULL
 	)",
 	// objects holds one row for each chunk stored in the backup folder, at
 	// AB/CD/SHA256, where sha256 is the hash of the chunk's original bytes.
@@ -144,19 +151,8 @@ fn write_schema(path string, config Config) ! {
 
 	add_no_compress_rows(mut db, config.no_compress)!
 
-	mut pattern_stmt := db.prepare('INSERT INTO patterns (kind, glob) VALUES (?, ?)')!
-	for pattern in config.includes {
-		pattern_stmt.query({
-			'?1': vsql.new_varchar_value('include')
-			'?2': vsql.new_varchar_value(pattern)
-		})!
-	}
-	for pattern in config.excludes {
-		pattern_stmt.query({
-			'?1': vsql.new_varchar_value('exclude')
-			'?2': vsql.new_varchar_value(pattern)
-		})!
-	}
+	add_patterns(mut db, 'include', config.includes)!
+	add_patterns(mut db, 'exclude', config.excludes)!
 	db.query('COMMIT')!
 }
 
@@ -240,7 +236,7 @@ fn read_config_rows(mut db vsql.Connection, dir string) !Config {
 
 	mut includes := []string{}
 	mut excludes := []string{}
-	for row in db.query('SELECT kind, glob FROM patterns')! {
+	for row in db.query('SELECT kind, glob FROM patterns ORDER BY seq')! {
 		pattern := row.get_string('GLOB')!
 		if row.get_string('KIND')! == 'include' {
 			includes << pattern
@@ -284,6 +280,82 @@ fn set_min_versions(dir string, n i64) ! {
 	stmt.query({
 		'?1': limit_value(n, .integer)
 	}) or { return at(.write_index, err) }
+}
+
+// PatternChanges are includes and excludes to add and remove. Includes must
+// already be absolute paths.
+struct PatternChanges {
+	add_includes    []string
+	add_excludes    []string
+	remove_includes []string
+	remove_excludes []string
+}
+
+// change_patterns adds and then removes includes and excludes, in one
+// transaction. Removing one that isn't there is an error, adding one that is
+// does nothing, and at least one include must be left. It doesn't change any
+// backed up files: backup stops looking at paths that are no longer included
+// (without recording them as deleted), and cleanup --excluded removes them.
+fn change_patterns(dir string, c PatternChanges) ! {
+	mut db := open_database(dir)!
+	defer {
+		db.close()
+	}
+	current := read_config(mut db, dir)!
+	includes := no_compress_list(current.includes, c.add_includes, c.remove_includes) or {
+		return stage_error(.usage, err.msg().replace('no compress pattern', 'include'))
+	}
+	no_compress_list(current.excludes, c.add_excludes, c.remove_excludes) or {
+		return stage_error(.usage, err.msg().replace('no compress pattern', 'exclude'))
+	}
+	if includes.len == 0 {
+		return stage_error(.usage, 'at least one include is required')
+	}
+	update_patterns(mut db, current, c) or {
+		db.query('ROLLBACK') or {}
+		return at(.write_index, err)
+	}
+}
+
+fn update_patterns(mut db vsql.Connection, current Config, c PatternChanges) ! {
+	db.query('START TRANSACTION')!
+	add_patterns(mut db, 'include', c.add_includes.filter(it !in current.includes))!
+	add_patterns(mut db, 'exclude', c.add_excludes.filter(it !in current.excludes))!
+	mut stmt := db.prepare('DELETE FROM patterns WHERE kind = ? AND glob = ?')!
+	for kind, globs in {
+		'include': c.remove_includes
+		'exclude': c.remove_excludes
+	} {
+		for glob in globs {
+			stmt.query({
+				'?1': vsql.new_varchar_value(kind)
+				'?2': vsql.new_varchar_value(glob)
+			})!
+		}
+	}
+	db.query('COMMIT')!
+}
+
+// add_patterns adds patterns of kind after every existing pattern.
+fn add_patterns(mut db vsql.Connection, kind string, patterns []string) ! {
+	mut seq := 0
+	for row in db.query('SELECT COALESCE(MAX(seq), 0) AS seq FROM patterns')! {
+		seq = row.get_int('SEQ')!
+	}
+	mut stmt := db.prepare('INSERT INTO patterns (kind, glob, seq) VALUES (?, ?, ?)')!
+	mut seen := map[string]bool{}
+	for pattern in patterns {
+		if pattern in seen {
+			continue
+		}
+		seen[pattern] = true
+		seq++
+		stmt.query({
+			'?1': vsql.new_varchar_value(kind)
+			'?2': vsql.new_varchar_value(pattern)
+			'?3': vsql.new_integer_value(seq)
+		})!
+	}
 }
 
 // change_no_compress adds and then removes no_compress patterns. Removing a

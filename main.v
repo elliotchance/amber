@@ -13,9 +13,14 @@ const usage = 'usage:
       Includes are applied before excludes. An exclude without a "/" matches
       file and folder names (like "*.tmp"), otherwise it matches full paths.
 
-  amber config [-d folder] [--max-versions n] [--min-versions n] [--max-size size]
+  amber config [-d folder] [--include path ...] [--remove-include path ...]
+               [--exclude pattern ...] [--remove-exclude pattern ...] [--max-versions n] [--min-versions n] [--max-size size]
                [--keep-deleted days] [--no-compress pattern ...] [--compress pattern ...]
       Show the settings, or change them. Limits default to "unlimited".
+      --include and --exclude add to the patterns, --remove-include and
+      --remove-exclude remove from them. Backed up files that are no longer
+      included are kept as they are (not recorded as deleted); cleanup
+      --excluded removes them.
       --max-versions is the most previous versions of each file that are kept.
       --max-size (like 500G) is the most space the stored files can use. To
       stay under it, the oldest previous versions can be removed, but each file
@@ -32,7 +37,9 @@ const usage = 'usage:
       Back up every included file that is new or has changed. It runs cleanup
       first.
 
-  amber cleanup [-d folder]
+  amber cleanup [-d folder] [--excluded]
+      With --excluded, also remove every version of the files that are no
+      longer included (or are now excluded).
       Remove the versions and chunks that the limits no longer allow (old
       versions past --max-versions, files deleted longer ago than
       --keep-deleted, and old versions to fit --max-size).
@@ -139,6 +146,10 @@ fn cmd_config(args []string) ! {
 	versions_arg := fp.string('max-versions', 0, '', '')
 	size_arg := fp.string('max-size', 0, '', '')
 	keep_arg := fp.string('keep-deleted', 0, '', '')
+	add_includes := fp.string_multi('include', 0, '')
+	remove_includes := fp.string_multi('remove-include', 0, '')
+	add_excludes := fp.string_multi('exclude', 0, '')
+	remove_excludes := fp.string_multi('remove-exclude', 0, '')
 	min_arg := fp.string('min-versions', 0, '', '')
 	add_no_compress := fp.string_multi('no-compress', 0, '')
 	remove_no_compress := fp.string_multi('compress', 0, '')
@@ -175,6 +186,25 @@ fn cmd_config(args []string) ! {
 		}
 		max_size := if size_arg == '' { ?i64(none) } else { parse_max_size(size_arg)! }
 		set_limits(dir, max_versions, max_size)!
+	}
+	if add_includes.len + remove_includes.len + add_excludes.len + remove_excludes.len > 0 {
+		mut abs_includes := []string{}
+		for include in add_includes {
+			if !os.exists(include) {
+				return stage_error(.usage, 'include ${include} does not exist')
+			}
+			abs_includes << os.real_path(include)
+		}
+		change_patterns(dir, PatternChanges{
+			add_includes:    abs_includes
+			add_excludes:    add_excludes
+			remove_includes: remove_includes.map(if os.exists(it) {
+				os.real_path(it)
+			} else {
+				os.abs_path(it)
+			})
+			remove_excludes: remove_excludes
+		})!
 	}
 	if add_no_compress.len > 0 || remove_no_compress.len > 0 {
 		change_no_compress(dir, add_no_compress, remove_no_compress)!
@@ -227,6 +257,9 @@ fn cmd_backup(args []string) ! {
 	if result.pruned > 0 {
 		summary += ', ${result.pruned} old versions pruned'
 	}
+	if result.excluded > 0 {
+		summary += ', ${result.excluded} no longer included (kept)'
+	}
 	println(summary)
 	if result.skipped > 0 {
 		return stage_error(.read_source, '${result.skipped} files could not be read')
@@ -236,9 +269,10 @@ fn cmd_backup(args []string) ! {
 fn cmd_cleanup(args []string) ! {
 	mut fp := flag.new_flag_parser(args)
 	dir := fp.string('dir', `d`, '.', '')
+	excluded := fp.bool('excluded', 0, false, '')
 	fp.finalize() or { return at(.usage, err) }
 
-	result := cleanup(dir, time_to_us(time.utc()), fn (line string) {
+	result := cleanup(dir, time_to_us(time.utc()), excluded, fn (line string) {
 		println(line)
 	})!
 	if result.versions == 0 {

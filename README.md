@@ -71,10 +71,13 @@ amber config -d /Volumes/Backup/amber --max-versions 10 --min-versions 2 --max-s
 amber config -d /Volumes/Backup/amber --keep-deleted 90
 amber config -d /Volumes/Backup/amber --no-compress "*.log" --no-compress "/Users/me/Videos/*"
 amber config -d /Volumes/Backup/amber --compress "*.zip"
+amber config -d /Volumes/Backup/amber --include ~/Music --exclude "*.iso" --remove-exclude "*.tmp"
 ```
 
 | Option | Default | |
 |---|---|---|
+| `--include path` | | Adds a path to back up. `--remove-include path` removes one (at least one must be left). |
+| `--exclude pattern` | | Adds an exclude. `--remove-exclude pattern` removes one. |
 | `--max-versions n` | unlimited | The most previous versions of each file that are kept, on top of its latest version. A delete counts as a version. |
 | `--max-size size` | unlimited | The most space the stored chunks can use, like `500G`, `1.5T` or `200M` (powers of 1024). |
 | `--min-versions n` | unlimited | To stay under `--max-size`, the oldest previous versions can be removed, but each file keeps at least this many. With the default nothing is removed, and `backup` stops when it's full. |
@@ -83,6 +86,12 @@ amber config -d /Volumes/Backup/amber --compress "*.zip"
 
 Version numbers are never reused, and the latest version of a file that still
 exists is never removed.
+
+Changing the includes and excludes doesn't change what's already backed up.
+Files that are no longer included (or are now excluded) aren't recorded as
+deleted: their history is kept as it is, `backup` counts them as "no longer
+included", and they can still be restored. Including them again carries on
+from their latest version. `amber cleanup --excluded` removes their history.
 
 If a new chunk wouldn't fit `--max-size` (or the disk fills up), `backup`
 stops. Every file backed up before that is kept, and nothing of the file that
@@ -93,10 +102,12 @@ didn't fit is left behind, so after raising the limit (or freeing space)
 
 ```sh
 amber cleanup -d /Volumes/Backup/amber
+amber cleanup -d /Volumes/Backup/amber --excluded
 ```
 
 Removes the versions and chunks the settings no longer allow. `backup` does
-the same before it starts (and again at the end).
+the same before it starts (and again at the end). `--excluded` also removes
+every version of the files the includes and excludes no longer back up.
 
 ### Check
 
@@ -190,7 +201,7 @@ Every command uses the same exit codes. Each one is the stage that failed:
 |---|---|
 | `config` | The index `version`, and the settings (NULL for unlimited or forever). |
 | `no_compress` | Patterns of files whose chunks are stored as is. |
-| `patterns` | Include and exclude globs. |
+| `patterns` | Include and exclude globs, in the order they were added. |
 | `objects` | One row per stored chunk: SHA-256, original and stored size, compression (`NONE` or `ZIP`). |
 | `parts` | The chunks of each file made of more than one chunk, in order, under a manifest (the SHA-256 of its chunks' hashes). |
 | `files` | One row per version of a path: version number, size, modified time (microseconds), SHA-256 of the whole file, manifest (none for a file that's one chunk, whose SHA-256 is its object), whether it was deleted, and when it was backed up. |

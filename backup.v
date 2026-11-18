@@ -11,6 +11,7 @@ mut:
 	deleted   int
 	skipped   int
 	pruned    int // old versions removed by max_versions or max_size
+	excluded  int // backed up paths that the patterns no longer include
 }
 
 // backup backs up every included file into the backup folder dir. now is the time
@@ -34,10 +35,7 @@ fn backup(dir string, now i64, log fn (string)) !BackupStats {
 		no_compress: config.no_compress
 	}
 
-	walker := Walker{
-		excludes: config.excludes
-		skip:     [config.dir]
-	}
+	walker := new_walker(config)
 	mut paths := []string{}
 	for include in config.includes {
 		walker.walk(include, mut paths)
@@ -100,6 +98,12 @@ fn backup(dir string, now i64, log fn (string)) !BackupStats {
 	gone.sort()
 	w.begin() or { return at(.write_index, err) }
 	for path in gone {
+		// A path that's no longer included (or is now excluded) wasn't deleted,
+		// so its history is kept as it is. cleanup --excluded removes it.
+		if !walker.covers(path) {
+			result.excluded++
+			continue
+		}
 		w.add_delete(path, latest[path].version + 1) or { return at(.write_index, err) }
 		log('deleted  ${path}')
 		result.deleted++

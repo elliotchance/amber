@@ -12,13 +12,15 @@ mut:
 
 // cleanup removes everything the limits no longer allow (the same as backup
 // does before it starts), at now (microseconds since the UNIX epoch).
-fn cleanup(dir string, now i64, log fn (string)) !PruneStats {
+// With excluded, it also removes every version of paths that the includes
+// and excludes no longer back up.
+fn cleanup(dir string, now i64, excluded bool, log fn (string)) !PruneStats {
 	mut db := open_database(dir)!
 	defer {
 		db.close()
 	}
 	config := read_config(mut db, dir)!
-	return prune(mut db, config, now, log)!
+	return prune_with(mut db, config, now, excluded, log)!
 }
 
 struct PruneRow {
@@ -42,12 +44,16 @@ struct PruneRow {
 // committed before the object files are removed, so a crash can leave an
 // unused file behind, but never a version without its object.
 fn prune(mut db vsql.Connection, config Config, now i64, log fn (string)) !PruneStats {
+	return prune_with(mut db, config, now, false, log)!
+}
+
+fn prune_with(mut db vsql.Connection, config Config, now i64, excluded bool, log fn (string)) !PruneStats {
 	if config.max_versions == unlimited && config.max_size == unlimited
-		&& config.keep_deleted == unlimited {
+		&& config.keep_deleted == unlimited && !excluded {
 		return PruneStats{}
 	}
 
-	mut p := plan_prune(mut db, config, now) or { return at(.read_index, err) }
+	mut p := plan_prune(mut db, config, now, excluded) or { return at(.read_index, err) }
 	if p.remove.len == 0 {
 		return PruneStats{}
 	}
@@ -71,7 +77,7 @@ fn prune(mut db vsql.Connection, config Config, now i64, log fn (string)) !Prune
 }
 
 // plan_prune works out which versions to remove, and which objects that frees.
-fn plan_prune(mut db vsql.Connection, config Config, now i64) !Pruner {
+fn plan_prune(mut db vsql.Connection, config Config, now i64, excluded bool) !Pruner {
 	// refs counts what uses each object: versions of files that are one chunk,
 	// and manifests (once for each time the chunk appears in it).
 	mut by_path := map[string][]PruneRow{}
@@ -121,11 +127,26 @@ fn plan_prune(mut db vsql.Connection, config Config, now i64) !Pruner {
 		total:         total
 	}
 
-	// A path deleted more than keep_deleted days ago is removed completely.
+	// A path the patterns no longer back up is removed completely (only when
+	// asked for), and so is a path deleted more than keep_deleted days ago.
 	mut gone := map[string]bool{}
+	if excluded {
+		walker := new_walker(config)
+		for path, rows in by_path {
+			if !walker.covers(path) {
+				for r in rows {
+					p.drop(r)
+				}
+				gone[path] = true
+			}
+		}
+	}
 	if config.keep_deleted != unlimited {
 		cutoff := now - config.keep_deleted * 86_400_000_000
 		for path, rows in by_path {
+			if path in gone {
+				continue
+			}
 			last := rows.last()
 			if last.deleted && last.backed_up <= cutoff {
 				for r in rows {
