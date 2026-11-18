@@ -26,31 +26,27 @@ was at any point in time.
 
 ## Install
 
-amber is built from source. It needs [V](https://vlang.io) and zlib, which
-macOS already has (on Linux install `zlib1g-dev` or your distribution's
-equivalent).
+Download the zip for your system from the
+[latest release](https://github.com/elliotchance/amber/releases/latest), unzip
+it and put `amber` somewhere on your `PATH`. For example, on a Mac with Apple
+silicon:
 
 ```sh
-git clone https://github.com/elliotchance/amber.git
-cd amber
-v install elliotchance.vsql
-v -prod -o amber .
+curl -fsSLO https://github.com/elliotchance/amber/releases/latest/download/amber-macos-arm64.zip
+unzip amber-macos-arm64.zip
 sudo mv amber /usr/local/bin/
 ```
 
-### Update
+| System | Zip |
+|---|---|
+| macOS (Apple silicon) | `amber-macos-arm64.zip` |
+| macOS (Intel) | `amber-macos-x86-64.zip` |
+| Linux (x86-64) | `amber-linux-x86-64.zip` |
+| Linux (ARM64) | `amber-linux-arm64.zip` |
 
-From the `amber` folder:
-
-```sh
-git pull
-v update
-v -prod -o amber .
-sudo mv amber /usr/local/bin/
-```
-
-Existing backups are upgraded automatically the first time the new version
-opens them. A backup used by a newer amber can't be opened by an older one.
+To update, do the same again. Existing backups are upgraded automatically the
+first time the new version opens them. A backup used by a newer amber can't be
+opened by an older one.
 
 ## Usage
 
@@ -223,6 +219,14 @@ Every command uses the same exit codes, so scripts can tell what failed:
 
 ## Development
 
+amber is written in [V](https://vlang.io). It needs zlib, which macOS already
+has (on Linux install `zlib1g-dev`).
+
 ```sh
+v install elliotchance.vsql
 v test .
+v -prod -o amber .
 ```
+
+Pushing a tag that starts with `v` (like `v1.0.0`) publishes the binaries for
+every system to its release.

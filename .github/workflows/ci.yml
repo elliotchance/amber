@@ -1,0 +1,109 @@
+name: CI
+
+# Every pull request into main and every tag runs the tests on each OS and
+# architecture and builds amber there. A tag then publishes the binaries to its
+# release.
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+
+# A new push to a pull request cancels its previous run.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  # amber is built from V master and the newest vsql, like users get from
+  # "v up" and "v install". Windows isn't supported.
+  build:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux (x86-64)
+            os: linux-x86-64
+            runner: ubuntu-latest
+          - name: Linux (ARM64)
+            os: linux-arm64
+            runner: ubuntu-24.04-arm
+          - name: macOS (x86-64)
+            os: macos-x86-64
+            runner: macos-15-intel
+          - name: macOS (ARM64)
+            os: macos-arm64
+            runner: macos-latest
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install zlib
+        if: runner.os == 'Linux'
+        run: .github/workflows/retry.sh sudo apt-get install -y zlib1g-dev
+
+      - name: Set up V
+        run: .github/workflows/setup-v.sh
+
+      - name: Install vsql
+        run: .github/workflows/retry.sh v install elliotchance.vsql
+
+      - name: Show versions
+        run: |
+          v version
+          git -C ~/.vmodules/elliotchance/vsql log -1 --format='vsql %H %s'
+
+      - name: Check formatting
+        if: matrix.os == 'linux-x86-64'
+        run: v fmt -verify .
+
+      - name: Test
+        run: v test .
+
+      # The zip has only the amber binary. Its name has no version, so that
+      # the newest one can always be downloaded from the same URL.
+      - name: Build
+        run: |
+          v -prod -o amber .
+          ./amber init -d "$RUNNER_TEMP/backup" --include "$PWD" --exclude .git
+          ./amber backup -d "$RUNNER_TEMP/backup"
+          ./amber fsck -d "$RUNNER_TEMP/backup" --hash
+| head -3
+          zip amber-${{ matrix.os }}.zip amber
+
+      - name: Upload zip
+        uses: actions/upload-artifact@v7
+        with:
+          name: amber-${{ matrix.os }}
+          path: amber-${{ matrix.os }}.zip
+
+  # Publishes the zips once every build has passed, so a release is never
+  # missing one.
+  release:
+    name: Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Download zips
+        uses: actions/download-artifact@v8
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          ls -l amber-*/amber-*.zip
+          .github/workflows/retry.sh sh -c 'gh release view "$TAG" > /dev/null || gh release create "$TAG" --verify-tag --title "$TAG" --generate-notes'
+          .github/workflows/retry.sh gh release upload "$TAG" amber-*/amber-*.zip --clobber
