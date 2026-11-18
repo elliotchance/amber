@@ -33,9 +33,9 @@ fn object_path(dir string, sha string) string {
 	return os.join_path(dir, sha[0..2], sha[2..4], sha)
 }
 
-// should_compress is true unless the file is smaller than a block (it can't
-// use less space) or is already compressed. A zipped object is still only kept
-// if it's smaller than the original.
+// should_compress is true unless the chunk is smaller than a block (it can't
+// use less space) or comes from a file that's already compressed. A zipped
+// chunk is still only kept if it's smaller.
 fn should_compress(path string, size i64, blksize i64) bool {
 	if size < blksize {
 		return false
@@ -43,103 +43,164 @@ fn should_compress(path string, size i64, blksize i64) bool {
 	return os.file_ext(path).to_lower() !in compressed_extensions
 }
 
-// store_object copies path into the backup folder dir as sha and returns the
-// stored size and compression. room is how many more bytes can be stored (or
-// unlimited); the object is not kept if it wouldn't fit.
-//
-// Files are zipped with the zip command, which streams, so there's no limit on
-// size (it switches to ZIP64 over 4 GiB). Everything is written to a temporary
-// file first and removed if anything fails (including a full disk), so a
-// failed copy never leaves a partial object behind.
-fn store_object(path string, sha string, size i64, dir string, room i64) !(i64, string) {
+// encode_chunk returns the bytes to store for a chunk and their compression.
+// Chunks are at most max_chunk, so this happens in memory. A compressed chunk
+// is a standard ZIP archive with one entry, so `unzip -p` can read it.
+fn encode_chunk(path string, sha string, chunk []u8, blksize i64) !([]u8, string) {
+	if should_compress(path, chunk.len, blksize) {
+		if compressed := deflate_smaller(chunk) {
+			zipped := zip_single_entry(sha, chunk, compressed)
+			if zipped.len < chunk.len {
+				return zipped, 'ZIP'
+			}
+		}
+	}
+	return chunk, 'NONE'
+}
+
+// write_object writes data as the object sha. It goes to a temporary file
+// first, which is removed if anything fails (including a full disk), so a
+// failed write never leaves a partial object behind.
+fn write_object(dir string, sha string, data []u8) ! {
 	target := object_path(dir, sha)
 	tmp := target + '.tmp'
 	os.mkdir_all(os.dir(target)) or { return at(.write_object, err) }
-	os.rm(tmp) or {}
-
-	stored_size, compression := write_object(path, tmp, size, dir, room) or {
+	os.write_file_array(tmp, data) or {
 		os.rm(tmp) or {}
 		remove_empty_parents(target)
-		return err
+		return at(.write_object, err)
 	}
 	os.rename(tmp, target) or {
 		os.rm(tmp) or {}
 		return at(.write_object, err)
 	}
-	return stored_size, compression
 }
 
-fn write_object(path string, tmp string, size i64, dir string, room i64) !(i64, string) {
-	if should_compress(path, size, block_size(dir)) {
-		zip_file(path, tmp)!
-		zipped_size := i64(os.file_size(tmp))
-		if zipped_size < size {
-			check_room(path, zipped_size, room)!
-			return zipped_size, 'ZIP'
-		}
-		// Zipping didn't make it smaller, so store it as is.
-		os.rm(tmp) or { return at(.write_object, err) }
-	}
+// remove_object removes an object that no row refers to.
+fn remove_object(dir string, sha string) {
+	path := object_path(dir, sha)
+	os.rm(path) or {}
+	remove_empty_parents(path)
+}
 
-	check_room(path, size, room)!
-	os.cp(path, tmp) or { return at(.write_object, err) }
-	return i64(os.file_size(tmp)), 'NONE'
+// read_object returns the original contents of the object sha and checks them
+// against sha.
+fn read_object(dir string, sha string, compression string) ![]u8 {
+	path := object_path(dir, sha)
+	if !os.is_file(path) {
+		return stage_error(.missing_object, 'object ${sha} is missing')
+	}
+	stored := os.read_bytes(path) or { return at(.missing_object, err) }
+	data := if compression == 'ZIP' {
+		unzip_single_entry(stored) or {
+			return stage_error(.decompress, 'object ${sha}: ${err.msg()}')
+		}
+	} else {
+		stored
+	}
+	if sha256.sum(data).hex() != sha {
+		return stage_error(.checksum, 'object ${sha} does not match its SHA-256')
+	}
+	return data
 }
 
 fn check_room(path string, needed i64, room i64) ! {
 	if room != unlimited && needed > room {
 		if room <= 0 {
-			return stage_error(.no_space, 'max size reached: ${path} needs ${human_size(needed)} but the backup is ${human_size(-room)} over the max size')
+			return stage_error(.no_space, 'max size reached: ${path} needs ${human_size(needed)} more but the backup is ${human_size(-room)} over the max size')
 		}
-		return stage_error(.no_space, 'max size reached: ${path} needs ${human_size(needed)} but only ${human_size(room)} is left')
+		return stage_error(.no_space, 'max size reached: ${path} needs ${human_size(needed)} more but only ${human_size(room)} is left')
 	}
 }
 
-// restore_object writes the original contents of an object to out, which must
-// not exist yet.
-fn restore_object(object string, compression string, out string) ! {
-	if !os.is_file(object) {
-		return stage_error(.missing_object, 'object ${object} is missing')
-	}
-	if compression != 'ZIP' {
-		os.cp(object, out) or { return at(.write_target, err) }
-		return
-	}
+// zip_single_entry builds a ZIP archive that holds data (already deflated as
+// compressed) as one entry called name, so any unzip tool can restore an
+// object.
+fn zip_single_entry(name string, data []u8, compressed []u8) []u8 {
+	crc := crc32_of(data)
 
-	// unzip can only write an entry to a folder (without going through a
-	// shell), so it goes into a temporary folder next to out and is moved
-	// from there. The folder is on the same file system, so the move is
-	// just a rename.
-	tmp_dir := out + '.amber-tmp'
-	os.mkdir(tmp_dir) or { return at(.write_target, err) }
-	defer {
-		os.rmdir_all(tmp_dir) or {}
-	}
-	run_command(.decompress, ['unzip', '-q', '-j', '-o', object, '-d', tmp_dir])!
-	entries := os.ls(tmp_dir) or { return at(.decompress, err) }
-	if entries.len != 1 {
-		return stage_error(.decompress, 'object ${object} has ${entries.len} entries, expected 1')
-	}
-	os.rename(os.join_path(tmp_dir, entries[0]), out) or { return at(.write_target, err) }
+	mut out := []u8{cap: compressed.len + 2 * name.len + 100}
+	// Local file header.
+	put_u32(mut out, 0x04034b50)
+	put_u16(mut out, 20) // version needed to extract
+	put_u16(mut out, 0) // flags
+	put_u16(mut out, 8) // method: deflate
+	put_u16(mut out, 0) // modified time
+	put_u16(mut out, 0x21) // modified date: 1980-01-01
+	put_u32(mut out, crc)
+	put_u32(mut out, u32(compressed.len))
+	put_u32(mut out, u32(data.len))
+	put_u16(mut out, u16(name.len))
+	put_u16(mut out, 0) // extra field length
+	out << name.bytes()
+	out << compressed
+
+	// Central directory.
+	central_offset := out.len
+	put_u32(mut out, 0x02014b50)
+	put_u16(mut out, 20) // version made by
+	put_u16(mut out, 20) // version needed to extract
+	put_u16(mut out, 0) // flags
+	put_u16(mut out, 8) // method: deflate
+	put_u16(mut out, 0) // modified time
+	put_u16(mut out, 0x21) // modified date
+	put_u32(mut out, crc)
+	put_u32(mut out, u32(compressed.len))
+	put_u32(mut out, u32(data.len))
+	put_u16(mut out, u16(name.len))
+	put_u16(mut out, 0) // extra field length
+	put_u16(mut out, 0) // comment length
+	put_u16(mut out, 0) // disk number
+	put_u16(mut out, 0) // internal attributes
+	put_u32(mut out, 0) // external attributes
+	put_u32(mut out, 0) // offset of the local header
+	out << name.bytes()
+	central_size := out.len - central_offset
+
+	// End of central directory.
+	put_u32(mut out, 0x06054b50)
+	put_u16(mut out, 0) // this disk
+	put_u16(mut out, 0) // disk with the central directory
+	put_u16(mut out, 1) // entries on this disk
+	put_u16(mut out, 1) // total entries
+	put_u32(mut out, u32(central_size))
+	put_u32(mut out, u32(central_offset))
+	put_u16(mut out, 0) // comment length
+
+	return out
 }
 
-// zip_file zips path into a new archive at zip_path, which holds one entry.
-fn zip_file(path string, zip_path string) ! {
-	// -j stores just the file name, -X leaves out extra file attributes, and
-	// -q is quiet. zip_path ends in ".tmp", so zip won't add ".zip" to it.
-	run_command(.compress, ['zip', '-q', '-j', '-X', zip_path, path])!
+fn put_u16(mut out []u8, v u16) {
+	out << u8(v)
+	out << u8(v >> 8)
 }
 
-// run_command runs a command without a shell. A failure has the given stage, unless
-// the command isn't installed.
-fn run_command(stage Stage, args []string) ! {
-	os.find_abs_path_of_executable(args[0]) or {
-		return stage_error(.missing_tool, '${args[0]} is not installed, it is needed to store and restore compressed files')
+fn put_u32(mut out []u8, v u32) {
+	put_u16(mut out, u16(v))
+	put_u16(mut out, u16(v >> 16))
+}
+
+// unzip_single_entry returns the contents of the entry in a ZIP archive made by
+// zip_single_entry.
+fn unzip_single_entry(data []u8) ![]u8 {
+	if data.len < 30 || get_u32(data, 0) != 0x04034b50 || get_u16(data, 8) != 8 {
+		return error('not a ZIP object')
 	}
-	result := os.exec(args)
-	if result.exit_code != 0 {
-		return stage_error(stage, '${args[0]} failed (exit ${result.exit_code}): ${result.output.trim_space()}')
+	csize := int(get_u32(data, 18))
+	size := int(get_u32(data, 22))
+	start := 30 + int(get_u16(data, 26)) + int(get_u16(data, 28))
+	if start + csize > data.len || size > max_chunk {
+		return error('truncated ZIP object')
 	}
+	return inflate_chunk(data[start..start + csize], size)!
+}
+
+fn get_u16(data []u8, pos int) u16 {
+	return u16(data[pos]) | (u16(data[pos + 1]) << 8)
+}
+
+fn get_u32(data []u8, pos int) u32 {
+	return u32(get_u16(data, pos)) | (u32(get_u16(data, pos + 2)) << 16)
 }
 
 // remove_empty_parents removes the AB/CD folders of an object if they're

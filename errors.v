@@ -17,7 +17,6 @@ enum Stage {
 	compress       = 11
 	write_object   = 12
 	no_space       = 13 // max size reached
-	missing_tool   = 14 // zip or unzip isn't installed
 	not_found      = 20 // the path isn't in the backup at that time
 	target_exists  = 21
 	missing_object = 22

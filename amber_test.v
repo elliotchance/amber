@@ -1,6 +1,7 @@
 module main
 
 import os
+import crypto.sha256
 import elliotchance.vsql.vsql
 
 const day = i64(86_400_000_000)
@@ -167,9 +168,7 @@ fn test_compression() {
 	assert zipped.get('STORED_SIZE')!.int_value() == os.file_size(stored)
 	assert os.file_size(stored) < u64(big.len)
 
-	out := os.join_path(e.root, 'unzipped')
-	restore_object(stored, 'ZIP', out)!
-	assert os.read_file(out)! == big
+	assert read_object(e.dest, zipped.get_string('SHA256')!, 'ZIP')!.bytestr() == big
 	// The zip command's own tools can read it too.
 	assert os.execute('unzip -p ${stored}').output == big
 }
@@ -270,7 +269,7 @@ fn test_stats() {
 	assert 'Files:          1 (117.2 KiB)' in lines
 	assert 'Deleted files:  1' in lines
 	assert 'Versions:       3' in lines
-	assert 'Objects:        2 (1 zipped)' in lines
+	assert 'Chunks:         2 (1 zipped, 4.0 MiB average)' in lines
 }
 
 fn test_human_size() {
@@ -506,6 +505,159 @@ fn test_checksum_mismatch() {
 	os.write_file(object_path(e.dest, sha256_file(a)!), 'y'.repeat(10_000))!
 	restore(e.dest, e.src, os.join_path(e.root, 'out'), 1 * day, fn (_ string) {}) or {
 		assert exit_code(err) == 24
+		return
+	}
+	assert false
+}
+
+// random_bytes is repeatable pseudo-random data (xorshift64), which doesn't
+// compress and has no repeats, so chunk boundaries are realistic.
+fn random_bytes(n int, seed u64) []u8 {
+	mut out := []u8{len: n}
+	mut x := seed
+	for i in 0 .. n {
+		x ^= x << 13
+		x ^= x >> 7
+		x ^= x << 17
+		out[i] = u8(x >> 32)
+	}
+	return out
+}
+
+fn chunk_sizes(data []u8) []int {
+	mut sizes := []int{}
+	mut start := 0
+	for start < data.len {
+		n := cut_point(data[start..])
+		sizes << n
+		start += n
+	}
+	return sizes
+}
+
+fn chunk_hashes(data []u8) []string {
+	mut hashes := []string{}
+	mut start := 0
+	for start < data.len {
+		n := cut_point(data[start..])
+		hashes << sha256.sum(data[start..start + n]).hex()
+		start += n
+	}
+	return hashes
+}
+
+fn test_chunk_sizes() {
+	data := random_bytes(64 << 20, 1)
+	sizes := chunk_sizes(data)
+	assert arrays_sum(sizes) == data.len
+	for s in sizes[..sizes.len - 1] {
+		assert s >= min_chunk
+		assert s <= max_chunk
+	}
+	// Averages about 4 MiB.
+	avg := data.len / sizes.len
+	assert avg > 2 << 20 && avg < 8 << 20, 'average ${avg}'
+	// Small data is one chunk.
+	assert chunk_sizes(random_bytes(1000, 2)) == [1000]
+	// The same data always cuts in the same places.
+	assert chunk_sizes(data) == sizes
+}
+
+fn arrays_sum(a []int) int {
+	mut n := 0
+	for x in a {
+		n += x
+	}
+	return n
+}
+
+fn test_insert_only_changes_nearby_chunks() {
+	data := random_bytes(40 << 20, 3)
+	before := chunk_hashes(data)
+
+	mut edited := []u8{}
+	edited << data[..100]
+	edited << 'a new ID3 tag that is longer than before'.bytes()
+	edited << data[100..]
+	after := chunk_hashes(edited)
+
+	shared := after.filter(it in before).len
+	assert shared >= after.len - 1, '${shared} of ${after.len} chunks shared'
+}
+
+fn test_chunked_file_round_trip() {
+	e := new_env('chunked')
+	e.init([])
+	data := random_bytes(12 << 20, 4)
+	path := e.write('big.bin', data.bytestr())
+	e.backup(1 * day)
+
+	rows := e.rows('SELECT sha256, manifest FROM files')
+	assert rows.len == 1
+	manifest := rows[0].get_string('MANIFEST')!
+	assert manifest.len == 64
+	assert rows[0].get_string('SHA256')! == sha256_file(path)!
+	parts := e.rows('SELECT seq, sha256 FROM parts ORDER BY seq')
+	assert parts.len == chunk_hashes(data).len
+	assert parts.map(it.get_string('SHA256')!) == chunk_hashes(data)
+	assert e.objects_on_disk().len == parts.len
+
+	// Same-length edit at the start: only the first chunk is new.
+	mut edited := data.clone()
+	edited[10] ^= 0xff
+	os.write_file_array(path, edited)!
+	e.backup(2 * day)
+	assert e.objects_on_disk().len == parts.len + 1
+
+	out := os.join_path(e.root, 'out')
+	restore(e.dest, e.src, out, 1 * day, fn (_ string) {})!
+	assert os.read_bytes(os.join_path(out, 'big.bin'))! == data
+	out2 := os.join_path(e.root, 'out2')
+	restore(e.dest, e.src, out2, 2 * day, fn (_ string) {})!
+	assert os.read_bytes(os.join_path(out2, 'big.bin'))! == edited
+}
+
+fn test_prune_chunked_versions() {
+	e := new_env('prune_chunks')
+	e.init([])
+	data := random_bytes(12 << 20, 5)
+	path := e.write('big.bin', data.bytestr())
+	e.backup(1 * day)
+	n := e.objects_on_disk().len
+
+	mut edited := data.clone()
+	edited[10] ^= 0xff
+	os.write_file_array(path, edited)!
+	e.backup(2 * day)
+	assert e.objects_on_disk().len == n + 1
+
+	// Dropping version 1 frees only its first chunk, the rest are shared.
+	set_limits(e.dest, 0, none)!
+	assert e.backup(3 * day).pruned == 1
+	assert e.objects_on_disk().len == n
+	assert e.rows('SELECT * FROM parts').len == n
+	out := os.join_path(e.root, 'out')
+	restore(e.dest, e.src, out, 3 * day, fn (_ string) {})!
+	assert os.read_bytes(os.join_path(out, 'big.bin'))! == edited
+
+	// Once the file is deleted and pruned, nothing is left.
+	os.rm(path)!
+	e.backup(4 * day)
+	e.backup(5 * day)
+	assert e.objects_on_disk().len == 0
+	assert e.rows('SELECT * FROM parts').len == 0
+}
+
+fn test_max_size_mid_file_leaves_nothing() {
+	e := new_env('mid_file')
+	e.init([])
+	set_limits(e.dest, none, 5 << 20)!
+	e.write('big.bin', random_bytes(12 << 20, 6).bytestr())
+	backup(e.dest, 1 * day, fn (_ string) {}) or {
+		assert exit_code(err) == 13
+		assert e.objects_on_disk().len == 0
+		assert e.rows('SELECT * FROM objects').len == 0
+		assert e.rows('SELECT * FROM files').len == 0
 		return
 	}
 	assert false

@@ -43,16 +43,22 @@ deleted  /Users/me/Documents/old.txt
 ```
 
 A file whose size and modified time match its latest version is skipped.
-Otherwise it's hashed (SHA-256) and stored once in the backup folder at
-`AB/CD/SHA256`, where `AB` and `CD` are the first four characters of the hash.
-Files with the same content share one object, so touching a file without
-changing it adds a version but doesn't store anything new.
+Otherwise it's read once and split into chunks with content-defined chunking
+(FastCDC): chunks average 4 MiB and are between 1 MiB and 16 MiB. Cut points
+depend on the content, not the offset, so an edit only changes the chunks
+around it, even if it inserts or removes bytes. Editing an MP3's tags, for
+example, usually stores one new chunk instead of the whole file.
 
-Files with an already compressed extension (MP3, MP4, JPEG, ZIP, RAR, ...) and
-files smaller than a block are stored as is. Everything else is zipped with the
-`zip` command, which streams, so any file size works. A zipped object is only
-kept if it's smaller than the original. Objects are normal ZIP files, so
-`unzip -p` can recover one without amber.
+Each chunk is stored once in the backup folder at `AB/CD/SHA256`, where `AB`
+and `CD` are the first four characters of its hash, and is shared by every file
+and version that contains it. A file smaller than 1 MiB is a single chunk.
+Touching a file without changing it adds a version but stores nothing new.
+
+Chunks of files with an already compressed extension (MP3, MP4, JPEG, ZIP, RAR,
+...) and chunks smaller than a block are stored as is. Everything else is
+compressed in memory with zlib and kept only if it's smaller. A compressed
+chunk is a standard ZIP file, so `unzip -p` can read one without amber, and the
+order of a file's chunks is in the `parts` table.
 
 Every change to a path, including a delete, is a new version numbered from 1.
 Symbolic links are skipped.
@@ -132,7 +138,6 @@ Every command uses the same exit codes. Each one is the stage that failed:
 | 11 | Compress (`zip`) |
 | 12 | Write object |
 | 13 | No space: `--max-size` reached |
-| 14 | `zip` or `unzip` isn't installed |
 | 20 | Not found: the path isn't in the backup at that time |
 | 21 | The restore target already exists |
 | 22 | Missing object: the index points to an object that isn't there |
@@ -146,12 +151,14 @@ Every command uses the same exit codes. Each one is the stage that failed:
 |---|---|
 | `config` | `max_versions` and `max_size` (NULL for unlimited). |
 | `patterns` | Include and exclude globs. |
-| `objects` | One row per stored object: SHA-256, original and stored size, compression (`NONE` or `ZIP`). |
-| `files` | One row per version of a path: version number, size, modified time (microseconds), SHA-256, whether it was deleted, and when it was backed up. |
+| `objects` | One row per stored chunk: SHA-256, original and stored size, compression (`NONE` or `ZIP`). |
+| `parts` | The chunks of each file made of more than one chunk, in order, under a manifest (the SHA-256 of its chunks' hashes). |
+| `files` | One row per version of a path: version number, size, modified time (microseconds), SHA-256 of the whole file, manifest (none for a file that's one chunk, whose SHA-256 is its object), whether it was deleted, and when it was backed up. |
 
 ## Building
 
-Needs `zip` and `unzip` at runtime.
+Needs zlib (`libz`), which macOS has. On Linux install its headers (for
+example `zlib1g-dev`).
 
 ```sh
 v install elliotchance.vsql

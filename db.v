@@ -17,18 +17,31 @@ const schema = [
 		kind VARCHAR(7) NOT NULL CHECK (kind IN ('include', 'exclude')),
 		glob VARCHAR(4096) NOT NULL
 	)",
-	// objects holds one row for each file stored in the backup folder, at
-	// AB/CD/SHA256. Many files (or versions of a file) can share
-	// the same object.
+	// objects holds one row for each chunk stored in the backup folder, at
+	// AB/CD/SHA256, where sha256 is the hash of the chunk's original bytes.
+	// size is the chunk's original size and stored_size its size on disk.
+	// Chunks are shared by every file (and version) that contains them.
 	"CREATE TABLE objects (
 		sha256 VARCHAR(64) NOT NULL PRIMARY KEY,
 		size BIGINT NOT NULL,
 		stored_size BIGINT NOT NULL,
 		compression VARCHAR(4) NOT NULL CHECK (compression IN ('NONE', 'ZIP'))
 	)",
+	// parts lists the chunks of a file made of more than one chunk, in order.
+	// A manifest is the SHA-256 of its chunks' hashes (as hex, one after the
+	// other), so files with the same chunks share one manifest.
+	'CREATE TABLE parts (
+		manifest VARCHAR(64) NOT NULL,
+		seq INTEGER NOT NULL,
+		sha256 VARCHAR(64) NOT NULL,
+		PRIMARY KEY (manifest, seq)
+	)',
 	// files is only ever inserted into. Each row is a new version of a path,
-	// numbered from 1 (a delete is a version too). A deleted row has no size,
-	// modified or sha256. backed_up is when the backup run started.
+	// numbered from 1 (a delete is a version too). sha256 is the hash of the
+	// whole file. A file that's one chunk has no manifest and sha256 is also
+	// its object. Otherwise manifest lists its chunks in parts. A deleted row
+	// has no size, modified, sha256 or manifest. backed_up is when the backup
+	// run started.
 	'CREATE TABLE files (
 		id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
 		path VARCHAR(4096) NOT NULL,
@@ -36,6 +49,7 @@ const schema = [
 		size BIGINT,
 		modified TIMESTAMP(6),
 		sha256 VARCHAR(64),
+		manifest VARCHAR(64),
 		deleted BOOLEAN NOT NULL,
 		backed_up TIMESTAMP(6) NOT NULL,
 		UNIQUE (path, version)
@@ -61,6 +75,7 @@ struct FileVersion {
 	size     i64
 	modified i64 // microseconds since the UNIX epoch
 	sha256   string
+	manifest string // empty when the file is one chunk (sha256 is its object)
 	deleted  bool
 }
 
@@ -205,7 +220,7 @@ fn latest_version_rows(mut db vsql.Connection, prefix string, as_of i64) !map[st
 	mut result := map[string]FileVersion{}
 	as_of_value := vsql.new_timestamp_value(us_to_timestamp(as_of))!
 	mut rows := if prefix == '' {
-		mut stmt := db.prepare('SELECT path, version, size, modified, sha256, deleted FROM files
+		mut stmt := db.prepare('SELECT path, version, size, modified, sha256, manifest, deleted FROM files
 			WHERE backed_up <= ? ORDER BY id')!
 		stmt.query({
 			'?1': as_of_value
@@ -214,7 +229,7 @@ fn latest_version_rows(mut db vsql.Connection, prefix string, as_of i64) !map[st
 		// Everything under "/a/b/" sorts between "/a/b/" and "/a/b0", since "0"
 		// comes straight after "/".
 		dir := prefix.trim_right('/') + '/'
-		mut stmt := db.prepare('SELECT path, version, size, modified, sha256, deleted FROM files
+		mut stmt := db.prepare('SELECT path, version, size, modified, sha256, manifest, deleted FROM files
 			WHERE (path = ? OR (path >= ? AND path < ?)) AND backed_up <= ?
 			ORDER BY id')!
 		stmt.query({
@@ -241,6 +256,7 @@ fn latest_version_rows(mut db vsql.Connection, prefix string, as_of i64) !map[st
 				size:     row.get('SIZE')!.int_value()
 				modified: time_to_us(row.get('MODIFIED')!.time_value().t)
 				sha256:   row.get_string('SHA256')!
+				manifest: if row.get_null('MANIFEST')! { '' } else { row.get_string('MANIFEST')! }
 			}
 		}
 	}
@@ -256,6 +272,35 @@ fn known_object_rows(mut db vsql.Connection) !map[string]string {
 	mut result := map[string]string{}
 	for row in db.query('SELECT sha256, compression FROM objects')! {
 		result[row.get_string('SHA256')!] = row.get_string('COMPRESSION')!
+	}
+	return result
+}
+
+// known_manifests returns every manifest in parts.
+fn known_manifests(mut db vsql.Connection) !map[string]bool {
+	return known_manifest_rows(mut db) or { return at(.read_index, err) }
+}
+
+fn known_manifest_rows(mut db vsql.Connection) !map[string]bool {
+	mut result := map[string]bool{}
+	for row in db.query('SELECT manifest FROM parts WHERE seq = 0')! {
+		result[row.get_string('MANIFEST')!] = true
+	}
+	return result
+}
+
+// manifest_chunks returns the chunks of a manifest in order.
+fn manifest_chunks(mut db vsql.Connection, manifest string) ![]string {
+	return manifest_chunk_rows(mut db, manifest) or { return at(.read_index, err) }
+}
+
+fn manifest_chunk_rows(mut db vsql.Connection, manifest string) ![]string {
+	mut stmt := db.prepare('SELECT sha256 FROM parts WHERE manifest = ? ORDER BY seq')!
+	mut result := []string{}
+	for row in stmt.query({
+		'?1': vsql.new_varchar_value(manifest)
+	})! {
+		result << row.get_string('SHA256')!
 	}
 	return result
 }

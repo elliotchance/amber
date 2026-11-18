@@ -1,5 +1,6 @@
 module main
 
+import crypto.sha256
 import elliotchance.vsql.vsql
 
 struct BackupStats {
@@ -26,7 +27,9 @@ fn backup(dir string, now i64, log fn (string)) !BackupStats {
 	result.pruned += prune(mut db, config, log)!.versions
 	latest := latest_versions(mut db, '', now)!
 	mut objects := known_objects(mut db)!
+	mut manifests := known_manifests(mut db)!
 	mut total := stored_total(mut db)!
+	blksize := block_size(config.dir)
 
 	walker := Walker{
 		excludes: config.excludes
@@ -53,35 +56,33 @@ fn backup(dir string, now i64, log fn (string)) !BackupStats {
 			continue
 		}
 
-		sha := sha256_file(path) or {
-			log('skipped  ${path}: ${err}')
-			result.skipped++
-			continue
-		}
-		// Each file is one transaction: its object (if it's new) is written and
-		// renamed into place first, then its rows are committed together. If
-		// backup is killed, the index never points at a missing object. At most
-		// one object can be left without rows, and the next backup records it.
-		new_object := sha !in objects
-		mut stored_size := i64(0)
-		mut compression := objects[sha] or { '' }
-		if new_object {
-			room := if config.max_size == unlimited { unlimited } else { config.max_size - total }
-			stored_size, compression = store_object(path, sha, st.size, config.dir, room) or {
-				// Everything backed up so far is committed, and the failed
-				// object was never written (or was removed), so running backup
-				// again carries on from here.
-				stage := if err is StageError { err.stage } else { Stage.write_object }
-				return stage_error(stage, 'backup stopped: ${err.msg()}; ${result.new + result.changed} files were backed up before stopping')
+		// Each file is one transaction: its new chunks are written first, then
+		// its rows are committed together. If backup is killed, the index never
+		// points at a missing chunk. The chunks of at most one file can be left
+		// without rows, and the next backup records them.
+		room := if config.max_size == unlimited { unlimited } else { config.max_size - total }
+		file := store_file(path, config.dir, objects, room, blksize) or {
+			if err is StageError && err.stage == .read_source {
+				log('skipped  ${path}: ${err.msg()}')
+				result.skipped++
+				continue
 			}
+			// Everything backed up so far is committed, and this file's chunks
+			// were removed again, so running backup again carries on from here.
+			stage := if err is StageError { err.stage } else { Stage.write_object }
+			return stage_error(stage, 'backup stopped: ${err.msg()}; ${result.new + result.changed} files were backed up before stopping')
 		}
 
-		w.add_file(path, prev.version + 1, st, sha, new_object, stored_size, compression) or {
+		new_manifest := file.manifest != '' && file.manifest !in manifests
+		w.add_file(path, prev.version + 1, st, file, new_manifest) or {
 			return at(.write_index, err)
 		}
-		if new_object {
-			total += stored_size
-			objects[sha] = compression
+		for o in file.new_objects {
+			objects[o.sha] = o.compression
+			total += o.stored_size
+		}
+		if new_manifest {
+			manifests[file.manifest] = true
 		}
 		if prev.version == 0 || prev.deleted {
 			log('new      ${path}')
@@ -106,6 +107,83 @@ fn backup(dir string, now i64, log fn (string)) !BackupStats {
 	return result
 }
 
+struct NewObject {
+	sha         string
+	size        i64
+	stored_size i64
+	compression string
+}
+
+// StoredFile is a file whose chunks are all in the backup folder, but which
+// isn't in the index yet.
+struct StoredFile {
+mut:
+	sha256      string // of the whole file
+	manifest    string // empty for a file that's one chunk
+	chunks      []string
+	new_objects []NewObject
+	new_bytes   i64
+}
+
+// store_file reads path once: it's split into chunks, each chunk that isn't
+// stored yet is written, and the whole file is hashed. objects is every chunk
+// already in the index, and room is how many more bytes can be stored. If
+// anything fails, the chunks it wrote are removed again (no row refers to
+// them yet).
+fn store_file(path string, dir string, objects map[string]string, room i64, blksize i64) !StoredFile {
+	mut file := StoredFile{}
+	store_chunks(path, dir, objects, room, blksize, mut file) or {
+		for o in file.new_objects {
+			remove_object(dir, o.sha)
+		}
+		return err
+	}
+	return file
+}
+
+fn store_chunks(path string, dir string, objects map[string]string, room i64, blksize i64, mut file StoredFile) ! {
+	mut c := new_chunker(path) or { return at(.read_source, err) }
+	defer {
+		c.close()
+	}
+	mut whole := sha256.new()
+	mut written := map[string]bool{}
+	for {
+		chunk, ok := c.next() or { return at(.read_source, err) }
+		if !ok {
+			break
+		}
+		whole.write(chunk) or { return at(.read_source, err) }
+		sha := sha256.sum(chunk).hex()
+		file.chunks << sha
+		if sha in objects || sha in written {
+			continue
+		}
+
+		data, compression := encode_chunk(path, sha, chunk, blksize) or {
+			return at(.compress, err)
+		}
+		check_room(path, file.new_bytes + data.len, room)!
+		write_object(dir, sha, data)!
+		written[sha] = true
+		file.new_objects << NewObject{
+			sha:         sha
+			size:        chunk.len
+			stored_size: data.len
+			compression: compression
+		}
+		file.new_bytes += data.len
+	}
+
+	file.sha256 = whole.sum([]u8{}).hex()
+	if file.chunks.len > 1 {
+		file.manifest = sha256.sum(file.chunks.join('').bytes()).hex()
+	} else {
+		// A file that's one chunk is its own object.
+		file.chunks = []
+	}
+}
+
 // IndexWriter adds the versions and objects of one backup run.
 struct IndexWriter {
 mut:
@@ -114,6 +192,7 @@ mut:
 	insert_file    vsql.PreparedStmt
 	insert_deleted vsql.PreparedStmt
 	insert_object  vsql.PreparedStmt
+	insert_part    vsql.PreparedStmt
 }
 
 fn new_index_writer(mut db vsql.Connection, now i64) !IndexWriter {
@@ -121,12 +200,13 @@ fn new_index_writer(mut db vsql.Connection, now i64) !IndexWriter {
 		db:             db
 		backed_up:      vsql.new_timestamp_value(us_to_timestamp(now))!
 		insert_file:    db.prepare('INSERT INTO files
-			(path, version, size, modified, sha256, deleted, backed_up)
-			VALUES (?, ?, ?, ?, ?, FALSE, ?)')!
+			(path, version, size, modified, sha256, manifest, deleted, backed_up)
+			VALUES (?, ?, ?, ?, ?, ?, FALSE, ?)')!
 		insert_deleted: db.prepare('INSERT INTO files
 			(path, version, deleted, backed_up) VALUES (?, ?, TRUE, ?)')!
 		insert_object:  db.prepare('INSERT INTO objects
 			(sha256, size, stored_size, compression) VALUES (?, ?, ?, ?)')!
+		insert_part:    db.prepare('INSERT INTO parts (manifest, seq, sha256) VALUES (?, ?, ?)')!
 	}
 }
 
@@ -138,41 +218,47 @@ fn (mut w IndexWriter) commit() ! {
 	w.db.query('COMMIT')!
 }
 
-// add_file records a new version of path (and its object, if it's new) in
-// one transaction.
-fn (mut w IndexWriter) add_file(path string, version int, st FileStat, sha string, new_object bool, stored_size i64, compression string) ! {
+// add_file records a new version of path, with its new chunks and manifest,
+// in one transaction.
+fn (mut w IndexWriter) add_file(path string, version int, st FileStat, file StoredFile, new_manifest bool) ! {
 	w.begin()!
-	w.write_file(path, version, st, sha, new_object, stored_size, compression) or {
+	w.write_file(path, version, st, file, new_manifest) or {
 		w.db.query('ROLLBACK') or {}
 		return err
 	}
 	w.commit()!
 }
 
-fn (mut w IndexWriter) write_file(path string, version int, st FileStat, sha string, new_object bool, stored_size i64, compression string) ! {
-	if new_object {
-		w.add_object(sha, st.size, stored_size, compression)!
+fn (mut w IndexWriter) write_file(path string, version int, st FileStat, file StoredFile, new_manifest bool) ! {
+	for o in file.new_objects {
+		w.insert_object.query({
+			'?1': vsql.new_varchar_value(o.sha)
+			'?2': vsql.new_bigint_value(o.size)
+			'?3': vsql.new_bigint_value(o.stored_size)
+			'?4': vsql.new_varchar_value(o.compression)
+		})!
 	}
-	w.add_version(path, version, st.size, st.mtime_us, sha)!
-}
-
-fn (mut w IndexWriter) add_object(sha string, size i64, stored_size i64, compression string) ! {
-	w.insert_object.query({
-		'?1': vsql.new_varchar_value(sha)
-		'?2': vsql.new_bigint_value(size)
-		'?3': vsql.new_bigint_value(stored_size)
-		'?4': vsql.new_varchar_value(compression)
-	})!
-}
-
-fn (mut w IndexWriter) add_version(path string, version int, size i64, mtime_us i64, sha string) ! {
+	if new_manifest {
+		for i, sha in file.chunks {
+			w.insert_part.query({
+				'?1': vsql.new_varchar_value(file.manifest)
+				'?2': vsql.new_integer_value(i)
+				'?3': vsql.new_varchar_value(sha)
+			})!
+		}
+	}
 	w.insert_file.query({
 		'?1': vsql.new_varchar_value(path)
 		'?2': vsql.new_integer_value(version)
-		'?3': vsql.new_bigint_value(size)
-		'?4': vsql.new_timestamp_value(us_to_timestamp(mtime_us))!
-		'?5': vsql.new_varchar_value(sha)
-		'?6': w.backed_up
+		'?3': vsql.new_bigint_value(st.size)
+		'?4': vsql.new_timestamp_value(us_to_timestamp(st.mtime_us))!
+		'?5': vsql.new_varchar_value(file.sha256)
+		'?6': if file.manifest == '' {
+			vsql.new_null_value(.is_varchar)
+		} else {
+			vsql.new_varchar_value(file.manifest)
+		}
+		'?7': w.backed_up
 	})!
 }
 

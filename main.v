@@ -39,7 +39,7 @@ exit codes (the stage that failed):
   1  unknown (a bug)         11  compress (zip)          21  restore target exists
   2  usage                   12  write object            22  missing object
   3  index missing           13  no space (max size)     23  decompress (unzip)
-  4  index exists            14  zip/unzip not installed 24  checksum mismatch
+  4  index exists                                        24  checksum mismatch
   5  create index                                        25  write restored file
   6  open index
   7  read index

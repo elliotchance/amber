@@ -11,10 +11,11 @@ mut:
 }
 
 struct PruneRow {
-	id      i64
-	path    string
-	version int
-	sha256  string // empty for a deleted version
+	id       i64
+	path     string
+	version  int
+	object   string // the object of a file that's one chunk
+	manifest string // the manifest of a file that's more than one chunk
 }
 
 // prune enforces config.max_versions and config.max_size:
@@ -57,19 +58,35 @@ fn prune(mut db vsql.Connection, config Config, log fn (string)) !PruneStats {
 
 // plan_prune works out which versions to remove, and which objects that frees.
 fn plan_prune(mut db vsql.Connection, config Config) !Pruner {
+	// refs counts what uses each object: versions of files that are one chunk,
+	// and manifests (once for each time the chunk appears in it).
 	mut by_path := map[string][]PruneRow{}
 	mut refs := map[string]int{}
-	for row in db.query('SELECT id, path, version, sha256 FROM files ORDER BY id')! {
+	mut manifest_refs := map[string]int{}
+	for row in db.query('SELECT id, path, version, sha256, manifest FROM files ORDER BY id')! {
+		manifest := if row.get_null('MANIFEST')! { '' } else { row.get_string('MANIFEST')! }
+		sha := if row.get_null('SHA256')! { '' } else { row.get_string('SHA256')! }
 		r := PruneRow{
-			id:      row.get('ID')!.int_value()
-			path:    row.get_string('PATH')!
-			version: row.get_int('VERSION')!
-			sha256:  if row.get_null('SHA256')! { '' } else { row.get_string('SHA256')! }
+			id:       row.get('ID')!.int_value()
+			path:     row.get_string('PATH')!
+			version:  row.get_int('VERSION')!
+			object:   if manifest == '' { sha } else { '' }
+			manifest: manifest
 		}
 		by_path[r.path] << r
-		if r.sha256 != '' {
-			refs[r.sha256]++
+		if r.object != '' {
+			refs[r.object]++
 		}
+		if r.manifest != '' {
+			manifest_refs[r.manifest]++
+		}
+	}
+	mut parts := map[string][]string{}
+	for row in db.query('SELECT manifest, sha256 FROM parts')! {
+		manifest := row.get_string('MANIFEST')!
+		sha := row.get_string('SHA256')!
+		parts[manifest] << sha
+		refs[sha]++
 	}
 	mut stored_sizes := map[string]i64{}
 	mut total := i64(0)
@@ -80,9 +97,11 @@ fn plan_prune(mut db vsql.Connection, config Config) !Pruner {
 	}
 
 	mut p := Pruner{
-		refs:         refs
-		stored_sizes: stored_sizes
-		total:        total
+		refs:          refs
+		manifest_refs: manifest_refs
+		parts:         parts
+		stored_sizes:  stored_sizes
+		total:         total
 	}
 
 	// Rows are in id order, so the last one of each path is its latest.
@@ -120,6 +139,12 @@ fn delete_pruned(mut db vsql.Connection, p Pruner) ! {
 			'?1': vsql.new_bigint_value(r.id)
 		})!
 	}
+	mut delete_parts := db.prepare('DELETE FROM parts WHERE manifest = ?')!
+	for manifest in p.freed_manifests {
+		delete_parts.query({
+			'?1': vsql.new_varchar_value(manifest)
+		})!
+	}
 	mut delete_object := db.prepare('DELETE FROM objects WHERE sha256 = ?')!
 	for sha in p.freed {
 		delete_object.query({
@@ -133,11 +158,14 @@ fn delete_pruned(mut db vsql.Connection, p Pruner) ! {
 // frees.
 struct Pruner {
 mut:
-	refs         map[string]int // versions using each object
-	stored_sizes map[string]i64
-	total        i64 // stored bytes still in use
-	remove       []PruneRow
-	freed        []string
+	refs            map[string]int // what uses each object
+	manifest_refs   map[string]int // versions using each manifest
+	parts           map[string][]string
+	stored_sizes    map[string]i64
+	total           i64 // stored bytes still in use
+	remove          []PruneRow
+	freed           []string // objects no longer used
+	freed_manifests []string
 }
 
 fn (p Pruner) freed_bytes() i64 {
@@ -150,11 +178,24 @@ fn (p Pruner) freed_bytes() i64 {
 
 fn (mut p Pruner) drop(r PruneRow) {
 	p.remove << r
-	if r.sha256 != '' {
-		p.refs[r.sha256]--
-		if p.refs[r.sha256] == 0 {
-			p.freed << r.sha256
-			p.total -= p.stored_sizes[r.sha256]
+	if r.object != '' {
+		p.release(r.object)
+	}
+	if r.manifest != '' {
+		p.manifest_refs[r.manifest]--
+		if p.manifest_refs[r.manifest] == 0 {
+			p.freed_manifests << r.manifest
+			for sha in p.parts[r.manifest] {
+				p.release(sha)
+			}
 		}
+	}
+}
+
+fn (mut p Pruner) release(sha string) {
+	p.refs[sha]--
+	if p.refs[sha] == 0 {
+		p.freed << sha
+		p.total -= p.stored_sizes[sha]
 	}
 }

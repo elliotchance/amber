@@ -42,7 +42,7 @@ fn stats(dir string, now i64) ![]string {
 	lines << 'Deleted files:  ${deleted_paths}'
 	lines << 'Versions:       ${versions}'
 	lines << ''
-	lines << 'Objects:        ${objects} (${zipped} zipped)'
+	lines << 'Chunks:         ${objects} (${zipped} zipped, ${human_size(avg_chunk)} average)'
 	lines << 'Original size:  ${human_size(original)}'
 	mut stored_line := 'Stored size:    ${human_size(stored)}'
 	if original > 0 {

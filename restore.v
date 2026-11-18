@@ -1,6 +1,8 @@
 module main
 
 import os
+import crypto.sha256
+import elliotchance.vsql.vsql
 
 // restore copies path, as it was at as_of (microseconds since the UNIX epoch),
 // into target, which must not exist yet. A folder's contents go directly into
@@ -47,17 +49,35 @@ fn restore(dir string, path_arg string, target string, as_of i64, log fn (string
 		out := os.join_path(target, rel)
 		os.mkdir_all(os.dir(out)) or { return at(.write_target, err) }
 
-		object := object_path(config.dir, v.sha256)
-		compression := objects[v.sha256] or {
-			return stage_error(.missing_object, '${v.path}: object ${v.sha256} is not in the index')
-		}
-		restore_object(object, compression, out)!
-
-		if sha256_file(out) or { return at(.checksum, err) } != v.sha256 {
-			return stage_error(.checksum, '${out}: restored file does not match its SHA-256 ${v.sha256}')
-		}
+		restore_file(mut db, config.dir, objects, v, out)!
 		set_mtime(out, v.modified) or { return at(.write_target, err) }
 		log('restored ${out}')
 	}
 	return files.len
+}
+
+// restore_file writes the chunks of v to out, which must not exist yet. Each
+// chunk is checked against its SHA-256 as it's read, and the whole file
+// against v.sha256 at the end.
+fn restore_file(mut db vsql.Connection, dir string, objects map[string]string, v FileVersion, out string) ! {
+	chunks := if v.manifest == '' { [v.sha256] } else { manifest_chunks(mut db, v.manifest)! }
+	mut f := os.create(out) or { return at(.write_target, err) }
+	defer {
+		f.close()
+	}
+	mut whole := sha256.new()
+	for sha in chunks {
+		compression := objects[sha] or {
+			return stage_error(.missing_object, '${v.path}: chunk ${sha} is not in the index')
+		}
+		data := read_object(dir, sha, compression) or {
+			return stage_error(if err is StageError { err.stage } else { Stage.missing_object },
+				'${v.path}: ${err.msg()}')
+		}
+		f.write(data) or { return at(.write_target, err) }
+		whole.write(data) or { return at(.checksum, err) }
+	}
+	if whole.sum([]u8{}).hex() != v.sha256 {
+		return stage_error(.checksum, '${out}: restored file does not match its SHA-256 ${v.sha256}')
+	}
 }
