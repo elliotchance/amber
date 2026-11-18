@@ -5,8 +5,13 @@ import time
 import elliotchance.vsql.vsql
 
 const schema = [
+	// max_versions is how many previous versions of each path are kept, and
+	// max_size is the most bytes the stored objects can use. NULL means
+	// unlimited.
 	'CREATE TABLE config (
-		destination VARCHAR(4096) NOT NULL
+		destination VARCHAR(4096) NOT NULL,
+		max_versions INTEGER CHECK (max_versions >= 0),
+		max_size BIGINT CHECK (max_size >= 0)
 	)',
 	"CREATE TABLE patterns (
 		kind VARCHAR(7) NOT NULL CHECK (kind IN ('include', 'exclude')),
@@ -37,10 +42,16 @@ const schema = [
 	)',
 ]
 
+// unlimited is the value of Config.max_versions and Config.max_size when
+// there's no limit (NULL in the database).
+const unlimited = i64(-1)
+
 struct Config {
-	destination string
-	includes    []string
-	excludes    []string
+	destination  string
+	includes     []string
+	excludes     []string
+	max_versions i64 = unlimited
+	max_size     i64 = unlimited
 }
 
 // FileVersion is the latest row of a path in files.
@@ -82,9 +93,12 @@ fn write_schema(path string, config Config) ! {
 		db.query(statement)!
 	}
 
-	mut stmt := db.prepare('INSERT INTO config (destination) VALUES (?)')!
+	mut stmt := db.prepare('INSERT INTO config (destination, max_versions, max_size)
+		VALUES (?, ?, ?)')!
 	stmt.query({
 		'?1': vsql.new_varchar_value(config.destination)
+		'?2': limit_value(config.max_versions, .integer)
+		'?3': limit_value(config.max_size, .bigint)
 	})!
 
 	mut pattern_stmt := db.prepare('INSERT INTO patterns (kind, glob) VALUES (?, ?)')!
@@ -112,8 +126,16 @@ fn open_database(path string) !&vsql.Connection {
 
 fn read_config(mut db vsql.Connection) !Config {
 	mut destination := ''
-	for row in db.query('SELECT destination FROM config')! {
+	mut max_versions := unlimited
+	mut max_size := unlimited
+	for row in db.query('SELECT destination, max_versions, max_size FROM config')! {
 		destination = row.get_string('DESTINATION')!
+		if !row.get_null('MAX_VERSIONS')! {
+			max_versions = row.get('MAX_VERSIONS')!.int_value()
+		}
+		if !row.get_null('MAX_SIZE')! {
+			max_size = row.get('MAX_SIZE')!.int_value()
+		}
 	}
 
 	mut includes := []string{}
@@ -128,10 +150,44 @@ fn read_config(mut db vsql.Connection) !Config {
 	}
 
 	return Config{
-		destination: destination
-		includes:    includes
-		excludes:    excludes
+		destination:  destination
+		includes:     includes
+		excludes:     excludes
+		max_versions: max_versions
+		max_size:     max_size
 	}
+}
+
+// set_limits changes max_versions and max_size. none leaves a limit as it is.
+fn set_limits(db_path string, max_versions ?i64, max_size ?i64) ! {
+	mut db := open_database(db_path)!
+	defer {
+		db.close()
+	}
+	if v := max_versions {
+		mut stmt := db.prepare('UPDATE config SET max_versions = ?')!
+		stmt.query({
+			'?1': limit_value(v, .integer)
+		})!
+	}
+	if v := max_size {
+		mut stmt := db.prepare('UPDATE config SET max_size = ?')!
+		stmt.query({
+			'?1': limit_value(v, .bigint)
+		})!
+	}
+}
+
+enum LimitType {
+	integer
+	bigint
+}
+
+fn limit_value(v i64, typ LimitType) vsql.Value {
+	if v == unlimited {
+		return vsql.new_null_value(if typ == .integer { .is_integer } else { .is_bigint })
+	}
+	return if typ == .integer { vsql.new_integer_value(int(v)) } else { vsql.new_bigint_value(v) }
 }
 
 // latest_versions returns the latest row of every path in files whose path is

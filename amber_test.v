@@ -267,7 +267,7 @@ fn test_stats() {
 
 	lines := stats(e.db, 3 * day)!
 	assert 'Exclude:        *.tmp' in lines
-	assert 'Backups:        2' in lines
+	assert 'Backups kept:   2' in lines
 	assert 'Files:          1 (117.2 KiB)' in lines
 	assert 'Deleted files:  1' in lines
 	assert 'Versions:       3' in lines
@@ -288,4 +288,156 @@ fn test_parse_local_time() {
 	assert us_to_time(us).local().format_ss() == '2026-07-04 12:30:15'
 	assert us_to_time(parse_local_time('2026-01-15 08:00')!).local().format_ss() == '2026-01-15 08:00:59'
 	assert us_to_time(parse_local_time('2026-01-15')!).local().format_ss() == '2026-01-15 23:59:59'
+}
+
+fn (e Env) objects_on_disk() []string {
+	mut found := []string{}
+	for ab in os.ls(e.dest) or { [] } {
+		for cd in os.ls(os.join_path(e.dest, ab)) or { [] } {
+			found << os.ls(os.join_path(e.dest, ab, cd)) or { [] }
+		}
+	}
+	found.sort()
+	return found
+}
+
+fn (e Env) versions(name string) []int {
+	return e.rows("SELECT version FROM files WHERE path = '${os.join_path(e.src, name)}' ORDER BY version").map(it.get_int('VERSION') or { panic(err) })
+}
+
+fn test_parse_limits() {
+	assert parse_max_versions('unlimited')! == unlimited
+	assert parse_max_versions('0')! == 0
+	assert parse_max_versions('12')! == 12
+	parse_max_versions('-1') or { assert err.msg().contains('invalid') }
+	parse_max_versions('x') or { assert err.msg().contains('invalid') }
+
+	assert parse_max_size('unlimited')! == unlimited
+	assert parse_max_size('1000')! == 1000
+	assert parse_max_size('2K')! == 2048
+	assert parse_max_size('500G')! == i64(500) << 30
+	assert parse_max_size('500GB')! == i64(500) << 30
+	assert parse_max_size('1.5TiB')! == i64(3) << 39
+	assert parse_max_size('10mb')! == i64(10) << 20
+	parse_max_size('G') or { assert err.msg().contains('invalid') }
+	parse_max_size('-5G') or { assert err.msg().contains('invalid') }
+	parse_max_size('5X') or { assert err.msg().contains('invalid') }
+}
+
+fn test_set_limits() {
+	e := new_env('limits')
+	e.init([])
+	set_limits(e.db, 3, none)!
+	mut db := vsql.open(e.db)!
+	mut c := read_config(mut db)!
+	db.close()
+	assert c.max_versions == 3
+	assert c.max_size == unlimited
+
+	set_limits(e.db, none, 1 << 20)!
+	db = vsql.open(e.db)!
+	c = read_config(mut db)!
+	db.close()
+	assert c.max_versions == 3
+	assert c.max_size == 1 << 20
+
+	set_limits(e.db, unlimited, unlimited)!
+	db = vsql.open(e.db)!
+	c = read_config(mut db)!
+	db.close()
+	assert c.max_versions == unlimited
+	assert c.max_size == unlimited
+}
+
+fn test_max_versions_prunes_old_versions_and_objects() {
+	e := new_env('max_versions')
+	e.init([])
+	for i in 1 .. 6 {
+		e.write('a.jpg', 'version ${i}')
+		e.backup(i * day)
+	}
+	assert e.versions('a.jpg') == [1, 2, 3, 4, 5]
+	assert e.objects_on_disk().len == 5
+
+	set_limits(e.db, 1, none)!
+	e.write('a.jpg', 'version 6')
+	stats := e.backup(6 * day)
+	assert stats.changed == 1
+	assert stats.pruned == 3 + 1 // v1-v3 before the backup and v4 after it
+
+	// Version numbers keep going, they aren't reused.
+	assert e.versions('a.jpg') == [5, 6]
+	assert e.rows('SELECT * FROM objects').len == 2
+	assert e.objects_on_disk().len == 2
+
+	// A delete is a version too.
+	os.rm(os.join_path(e.src, 'a.jpg'))!
+	e.backup(7 * day)
+	assert e.versions('a.jpg') == [6, 7]
+	assert e.objects_on_disk().len == 1
+
+	set_limits(e.db, 0, none)!
+	e.backup(8 * day)
+	assert e.versions('a.jpg') == [7]
+	assert e.objects_on_disk().len == 0
+	assert e.rows('SELECT * FROM objects').len == 0
+}
+
+fn test_max_size_prunes_oldest_previous_versions() {
+	e := new_env('max_size_prune')
+	e.init([])
+	e.write('a.jpg', 'a'.repeat(1000))
+	e.write('b.jpg', 'b'.repeat(1000))
+	e.backup(1 * day)
+	e.write('a.jpg', 'A'.repeat(1000))
+	e.backup(2 * day)
+	e.write('b.jpg', 'B'.repeat(1000))
+	e.backup(3 * day)
+	assert e.objects_on_disk().len == 4
+
+	// Only the oldest previous version (a.jpg v1) has to go to fit 3000 bytes.
+	set_limits(e.db, none, 3000)!
+	assert e.backup(4 * day).pruned == 1
+	assert e.versions('a.jpg') == [2]
+	assert e.versions('b.jpg') == [1, 2]
+
+	// Latest versions are never pruned, even when they don't fit.
+	set_limits(e.db, none, 100)!
+	assert e.backup(5 * day).pruned == 1
+	assert e.versions('a.jpg') == [2]
+	assert e.versions('b.jpg') == [2]
+	assert e.objects_on_disk().len == 2
+}
+
+fn test_max_size_stops_backup_cleanly() {
+	e := new_env('max_size_stop')
+	e.init([])
+	set_limits(e.db, none, 2500)!
+	e.write('1.jpg', '1'.repeat(1000))
+	e.write('2.jpg', '2'.repeat(1000))
+	e.write('3.jpg', '3'.repeat(1000))
+	e.write('4.jpg', '4'.repeat(1000))
+
+	backup(e.db, 1 * day, fn (_ string) {}) or {
+		assert err.msg().contains('max size reached')
+		assert err.msg().contains('3.jpg')
+		assert err.msg().contains('2 files were backed up')
+	}
+	// The first two are complete, nothing of 3.jpg is left behind.
+	assert e.rows('SELECT path FROM files ORDER BY path').map(os.base(it.get_string('PATH')!)) == [
+		'1.jpg',
+		'2.jpg',
+	]
+	assert e.rows('SELECT * FROM objects').len == 2
+	assert e.objects_on_disk().len == 2
+	assert !e.objects_on_disk().any(it.ends_with('.tmp'))
+
+	// After the device is expanded, backup carries on where it stopped.
+	set_limits(e.db, none, unlimited)!
+	assert e.backup(2 * day) == BackupStats{
+		new:       2
+		unchanged: 2
+	}
+	assert e.objects_on_disk().len == 4
+	assert e.versions('3.jpg') == [1]
 }

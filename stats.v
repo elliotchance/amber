@@ -53,15 +53,9 @@ fn stats(db_path string, now i64) ![]string {
 
 	mut lines := []string{}
 	lines << 'Database:       ${os.real_path(db_path)} (${human_size(i64(os.file_size(db_path)))})'
-	lines << 'Destination:    ${config.destination}'
-	for include in config.includes {
-		lines << 'Include:        ${include}'
-	}
-	for exclude in config.excludes {
-		lines << 'Exclude:        ${exclude}'
-	}
+	lines << config_lines(config)
 	lines << ''
-	lines << 'Backups:        ${runs}'
+	lines << 'Backups kept:   ${runs}'
 	if runs > 0 {
 		lines << 'First backup:   ${first}'
 		lines << 'Last backup:    ${last}'
@@ -77,6 +71,9 @@ fn stats(db_path string, now i64) ![]string {
 		stored_line += ' (${f64(stored) * 100 / f64(original):.1f}% of original)'
 	}
 	lines << stored_line
+	if config.max_size != unlimited {
+		lines << 'Space left:     ${human_size(config.max_size - stored)}'
+	}
 	return lines
 }
 

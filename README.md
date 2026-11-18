@@ -24,7 +24,31 @@ amber init \
 excludes. An exclude without a `/` matches file and folder names, otherwise it
 matches full paths (`--exclude "/Users/me/Projects/*/build"`). The destination
 folder must already exist. `init` only creates a new index; it fails if the
-file already exists.
+file already exists. It also takes `--max-versions` and `--max-size` (see
+below).
+
+### Limits
+
+```sh
+amber config                                  # show the settings
+amber config --max-versions 10 --max-size 500G
+amber config --max-size unlimited
+```
+
+- `--max-versions` is how many previous versions of each file are kept, on top
+  of its latest version. A delete counts as a version.
+- `--max-size` (like `500G`, `1.5T` or `200M`, in powers of 1024) is the most
+  space the objects in the destination can use.
+
+Both default to unlimited and can be changed at any time. `backup` prunes
+before and after it runs: first old versions beyond `--max-versions`, then the
+oldest previous versions until the objects fit `--max-size`. The latest version
+of a file is never pruned. Version numbers are never reused.
+
+If a new object wouldn't fit (or the disk fills up), `backup` stops with an
+error. Every file backed up before that is kept, and nothing of the file that
+didn't fit is left behind, so after raising the limit (or freeing space)
+`backup` carries on from there.
 
 ### Back up
 
@@ -89,7 +113,7 @@ amber stats
 
 | Table | |
 |---|---|
-| `config` | The destination folder. |
+| `config` | The destination folder, `max_versions` and `max_size` (NULL for unlimited). |
 | `patterns` | Include and exclude globs. |
 | `objects` | One row per stored object: SHA-256, original and stored size, compression (`NONE` or `ZIP`). |
 | `files` | One row per version of a path: version number, size, modified time (microseconds), SHA-256, whether it was deleted, and when it was backed up. |

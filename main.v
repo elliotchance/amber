@@ -8,9 +8,16 @@ const default_db_path = 'amber.vsql'
 
 const usage = 'usage:
   amber init [-f file.vsql] --destination folder --include path ... [--exclude pattern ...]
+             [--max-versions n] [--max-size size]
       Create a new backup file. --include and --exclude can be repeated.
       Includes are applied before excludes. An exclude without a "/" matches
       file and folder names (like "*.tmp"), otherwise it matches full paths.
+
+  amber config [-f file.vsql] [--max-versions n] [--max-size size]
+      Show the settings, or change the limits. --max-versions is how many
+      previous versions of each file are kept. --max-size (like 500G) is the
+      most space the destination can use. Both default to "unlimited", and the
+      next backup removes the oldest versions that no longer fit.
 
   amber backup [-f file.vsql]
       Back up every included file that is new or has changed.
@@ -36,6 +43,7 @@ fn main() {
 	match os.args[1] {
 		'init' { cmd_init(args) or { fail(err) } }
 		'backup' { cmd_backup(args) or { fail(err) } }
+		'config' { cmd_config(args) or { fail(err) } }
 		'ls' { cmd_ls(args) or { fail(err) } }
 		'restore' { cmd_restore(args) or { fail(err) } }
 		'stats' { cmd_stats(args) or { fail(err) } }
@@ -49,6 +57,8 @@ fn cmd_init(args []string) ! {
 	destination := fp.string('destination', 0, '', '')
 	includes := fp.string_multi('include', 0, '')
 	excludes := fp.string_multi('exclude', 0, '')
+	max_versions := parse_max_versions(fp.string('max-versions', 0, 'unlimited', ''))!
+	max_size := parse_max_size(fp.string('max-size', 0, 'unlimited', ''))!
 	fp.finalize()!
 
 	if destination == '' {
@@ -69,11 +79,53 @@ fn cmd_init(args []string) ! {
 	}
 
 	create_database(db_path, Config{
-		destination: os.real_path(destination)
-		includes:    abs_includes
-		excludes:    excludes
+		destination:  os.real_path(destination)
+		includes:     abs_includes
+		excludes:     excludes
+		max_versions: max_versions
+		max_size:     max_size
 	})!
 	println('created ${db_path}')
+}
+
+fn cmd_config(args []string) ! {
+	mut fp := flag.new_flag_parser(args)
+	db_path := fp.string('file', `f`, default_db_path, '')
+	versions_arg := fp.string('max-versions', 0, '', '')
+	size_arg := fp.string('max-size', 0, '', '')
+	fp.finalize()!
+
+	if versions_arg != '' || size_arg != '' {
+		max_versions := if versions_arg == '' {
+			?i64(none)
+		} else {
+			parse_max_versions(versions_arg)!
+		}
+		max_size := if size_arg == '' { ?i64(none) } else { parse_max_size(size_arg)! }
+		set_limits(db_path, max_versions, max_size)!
+	}
+
+	mut db := open_database(db_path)!
+	defer {
+		db.close()
+	}
+	for line in config_lines(read_config(mut db)!) {
+		println(line)
+	}
+}
+
+fn config_lines(config Config) []string {
+	mut lines := []string{}
+	lines << 'Destination:    ${config.destination}'
+	for include in config.includes {
+		lines << 'Include:        ${include}'
+	}
+	for exclude in config.excludes {
+		lines << 'Exclude:        ${exclude}'
+	}
+	lines << 'Max versions:   ${format_max_versions(config.max_versions)}'
+	lines << 'Max size:       ${format_max_size(config.max_size)}'
+	return lines
 }
 
 fn cmd_backup(args []string) ! {
@@ -87,6 +139,9 @@ fn cmd_backup(args []string) ! {
 	mut summary := '${result.new} new, ${result.changed} changed, ${result.deleted} deleted, ${result.unchanged} unchanged'
 	if result.skipped > 0 {
 		summary += ', ${result.skipped} skipped'
+	}
+	if result.pruned > 0 {
+		summary += ', ${result.pruned} old versions pruned'
 	}
 	println(summary)
 }

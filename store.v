@@ -46,30 +46,66 @@ fn should_compress(path string, size i64, blksize i64) bool {
 	return os.file_ext(path).to_lower() !in compressed_extensions
 }
 
-// store_object copies path into the destination as sha and returns the stored
-// size and compression. It writes to a temporary file first, so a failed copy
-// never leaves a broken object behind.
-fn store_object(path string, sha string, size i64, destination string) !(i64, string) {
-	target := object_path(destination, sha)
-	os.mkdir_all(os.dir(target))!
-	tmp := target + '.tmp'
+// SpaceLimitError is returned when storing an object would take the
+// destination over max_size.
+struct SpaceLimitError {
+	Error
+	path   string
+	needed i64
+	room   i64
+}
 
+fn (e SpaceLimitError) msg() string {
+	return 'max size reached: ${e.path} needs ${human_size(e.needed)} but only ${human_size(e.room)} is left'
+}
+
+// store_object copies path into the destination as sha and returns the stored
+// size and compression. room is how many more bytes can be stored (or
+// unlimited); nothing is written if the object wouldn't fit. The object is
+// written to a temporary file first, which is removed if anything fails, so a
+// failed copy (including a full disk) never leaves a partial object behind.
+fn store_object(path string, sha string, size i64, destination string, room i64) !(i64, string) {
+	mut data := []u8{}
 	mut compression := 'NONE'
+	mut stored_size := size
 	if should_compress(path, size, destination_block_size(destination)) {
-		data := os.read_bytes(path)!
-		zipped := zip_single_entry(sha, data)!
+		original := os.read_bytes(path)!
+		mut zipped := zip_single_entry(sha, original)!
 		// Some files don't get smaller, so it's not worth zipping them.
-		if zipped.len < data.len {
-			os.write_file_array(tmp, zipped)!
+		if zipped.len < original.len {
+			data = unsafe { zipped }
 			compression = 'ZIP'
+			stored_size = zipped.len
 		}
 	}
-	if compression == 'NONE' {
-		os.cp(path, tmp)!
+	if room != unlimited && stored_size > room {
+		return SpaceLimitError{
+			path:   path
+			needed: stored_size
+			room:   room
+		}
 	}
 
-	os.rename(tmp, target)!
-	return os.file_size(target), compression
+	target := object_path(destination, sha)
+	tmp := target + '.tmp'
+	os.mkdir_all(os.dir(target))!
+	write_object(path, tmp, compression, data) or {
+		os.rm(tmp) or {}
+		return err
+	}
+	os.rename(tmp, target) or {
+		os.rm(tmp) or {}
+		return err
+	}
+	return i64(os.file_size(target)), compression
+}
+
+fn write_object(path string, tmp string, compression string, data []u8) ! {
+	if compression == 'ZIP' {
+		os.write_file_array(tmp, data)!
+	} else {
+		os.cp(path, tmp)!
+	}
 }
 
 fn destination_block_size(destination string) i64 {

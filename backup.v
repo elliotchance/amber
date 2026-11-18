@@ -14,6 +14,7 @@ mut:
 	unchanged int
 	deleted   int
 	skipped   int
+	pruned    int // old versions removed by max_versions or max_size
 }
 
 // backup backs up every included file into the destination. now is the time
@@ -26,8 +27,14 @@ fn backup(db_path string, now i64, log fn (string)) !BackupStats {
 	}
 
 	config := read_config(mut db)!
+	mut result := BackupStats{}
+	result.pruned += prune(mut db, config, log)!.versions
 	latest := latest_versions(mut db, '', now)!
 	mut objects := known_objects(mut db)!
+	mut stored_total := i64(0)
+	for row in db.query('SELECT COALESCE(SUM(stored_size), 0) AS total FROM objects')! {
+		stored_total = row.get('TOTAL')!.int_value()
+	}
 
 	walker := Walker{
 		excludes: config.excludes
@@ -47,7 +54,6 @@ fn backup(db_path string, now i64, log fn (string)) !BackupStats {
 	mut insert_object := db.prepare('INSERT INTO objects
 		(sha256, size, stored_size, compression) VALUES (?, ?, ?, ?)')!
 
-	mut result := BackupStats{}
 	mut seen := map[string]bool{}
 	mut pending := 0
 	db.query('START TRANSACTION')!
@@ -71,7 +77,20 @@ fn backup(db_path string, now i64, log fn (string)) !BackupStats {
 			continue
 		}
 		if sha !in objects {
-			stored_size, compression := store_object(path, sha, st.size, config.destination)!
+			room := if config.max_size == unlimited {
+				unlimited
+			} else {
+				config.max_size - stored_total
+			}
+			stored_size, compression := store_object(path, sha, st.size, config.destination,
+				room) or {
+				// Keep everything backed up so far. Every committed version has
+				// its object, and the failed object was never written (or was
+				// removed), so running backup again carries on from here.
+				db.query('COMMIT')!
+				return error('backup stopped: ${err.msg()}; ${result.new + result.changed} files were backed up before stopping')
+			}
+			stored_total += stored_size
 			insert_object.query({
 				'?1': vsql.new_varchar_value(sha)
 				'?2': vsql.new_bigint_value(st.size)
@@ -118,5 +137,6 @@ fn backup(db_path string, now i64, log fn (string)) !BackupStats {
 	}
 
 	db.query('COMMIT')!
+	result.pruned += prune(mut db, config, log)!.versions
 	return result
 }
