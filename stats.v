@@ -63,12 +63,18 @@ fn format_local(us i64) string {
 	return us_to_time(us).local().format_ss()
 }
 
+const kb = i64(1000)
+const mb = 1000 * kb
+const gb = 1000 * mb
+const tb = 1000 * gb
+
+// human_size is a size in base 10 units (1 KB is 1000 bytes), like disk sizes.
 fn human_size(n i64) string {
-	units := ['B', 'KiB', 'MiB', 'GiB', 'TiB']
+	units := ['B', 'KB', 'MB', 'GB', 'TB']
 	mut size := f64(n)
 	mut unit := 0
-	for size >= 1024 && unit < units.len - 1 {
-		size /= 1024
+	for size >= 1000 && unit < units.len - 1 {
+		size /= 1000
 		unit++
 	}
 	return if unit == 0 { '${n} B' } else { '${size:.1f} ${units[unit]}' }

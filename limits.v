@@ -22,20 +22,24 @@ fn parse_min_versions(s string) !i64 {
 }
 
 // parse_max_size parses a size like "500G", "1.5T", "200MB" or "1048576" (bytes),
-// or "unlimited". Units are powers of 1024.
+// or "unlimited". Units are base 10 (1K is 1000 bytes), like disk sizes. KiB
+// and the other base 2 units aren't accepted, so a size can't be off by 10%.
 fn parse_max_size(s string) !i64 {
 	if s == 'unlimited' {
 		return unlimited
 	}
-	invalid := stage_error(.usage, 'invalid max size "${s}", use a size like 500G or "unlimited"')
-	mut number := s.to_upper().trim_right('B').trim_right('I')
+	invalid := stage_error(.usage, 'invalid max size "${s}", use a size like 500G (base 10, 1K is 1000 bytes) or "unlimited"')
+	if s.to_upper().ends_with('IB') {
+		return invalid
+	}
+	mut number := s.to_upper().trim_right('B')
 	mut multiplier := i64(1)
 	if number.len > 0 {
 		match number[number.len - 1] {
-			`K` { multiplier = i64(1) << 10 }
-			`M` { multiplier = i64(1) << 20 }
-			`G` { multiplier = i64(1) << 30 }
-			`T` { multiplier = i64(1) << 40 }
+			`K` { multiplier = kb }
+			`M` { multiplier = mb }
+			`G` { multiplier = gb }
+			`T` { multiplier = tb }
 			else {}
 		}
 		if multiplier > 1 {
@@ -59,8 +63,23 @@ fn format_max_versions(n i64) string {
 	return if n == unlimited { 'unlimited' } else { '${n}' }
 }
 
+// format_max_size is a max size the way --max-size takes it: the largest unit
+// it's a whole number of (like "500G"), or bytes.
 fn format_max_size(n i64) string {
-	return if n == unlimited { 'unlimited' } else { human_size(n) }
+	if n == unlimited {
+		return 'unlimited'
+	}
+	for unit, multiplier in {
+		'T': tb
+		'G': gb
+		'M': mb
+		'K': kb
+	} {
+		if n >= multiplier && n % multiplier == 0 {
+			return '${n / multiplier}${unit}'
+		}
+	}
+	return '${n}'
 }
 
 // parse_keep_deleted parses a number of days, or "forever".

@@ -271,17 +271,18 @@ fn test_stats() {
 	lines := stats(e.db, 3 * day)!
 	assert 'Exclude:        *.tmp' in lines
 	assert 'Backups kept:   2' in lines
-	assert 'Files:          1 (117.2 KiB)' in lines
+	assert 'Files:          1 (120.0 KB)' in lines
 	assert 'Deleted files:  1' in lines
 	assert 'Versions:       3' in lines
-	assert 'Chunks:         2 (1 zipped, 58.6 KiB average)' in lines
+	assert 'Chunks:         2 (1 zipped, 60.0 KB average)' in lines
 }
 
 fn test_human_size() {
 	assert human_size(0) == '0 B'
-	assert human_size(1023) == '1023 B'
-	assert human_size(1536) == '1.5 KiB'
-	assert human_size(i64(3) << 30) == '3.0 GiB'
+	assert human_size(1023) == '1.0 KB'
+	assert human_size(1536) == '1.5 KB'
+	assert human_size(3_000_000_000) == '3.0 GB'
+	assert human_size(999) == '999 B'
 }
 
 fn test_parse_local_time() {
@@ -317,11 +318,16 @@ fn test_parse_limits() {
 
 	assert parse_max_size('unlimited')! == unlimited
 	assert parse_max_size('1000')! == 1000
-	assert parse_max_size('2K')! == 2048
-	assert parse_max_size('500G')! == i64(500) << 30
-	assert parse_max_size('500GB')! == i64(500) << 30
-	assert parse_max_size('1.5TiB')! == i64(3) << 39
-	assert parse_max_size('10mb')! == i64(10) << 20
+	assert parse_max_size('2K')! == 2000
+	assert parse_max_size('500G')! == 500_000_000_000
+	assert parse_max_size('500GB')! == 500_000_000_000
+	assert parse_max_size('1.5T')! == 1_500_000_000_000
+	assert parse_max_size('10mb')! == 10_000_000
+	parse_max_size('1.5TiB') or { assert exit_code(err) == 2 }
+	assert format_max_size(500_000_000_000) == '500G'
+	assert format_max_size(1_500_000_000_000) == '1500G'
+	assert format_max_size(1_000_001) == '1000001'
+	assert format_max_size(unlimited) == 'unlimited'
 	parse_max_size('G') or { assert err.msg().contains('invalid') }
 	parse_max_size('-5G') or { assert err.msg().contains('invalid') }
 	parse_max_size('5X') or { assert err.msg().contains('invalid') }

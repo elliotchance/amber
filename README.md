@@ -142,7 +142,7 @@ amber config -d /Volumes/Backup/documents --root /Volumes/Other/Documents
 | `--include pattern` | everything | Adds an include. `--remove-include pattern` removes one. |
 | `--exclude pattern` | | Adds an exclude. `--remove-exclude pattern` removes one. |
 | `--max-versions n` | unlimited | The most previous versions of each file that are kept, on top of its latest version. A delete counts as a version. |
-| `--max-size size` | unlimited | The most space the backup can use, like `500G`, `1.5T` or `200M` (powers of 1024). |
+| `--max-size size` | unlimited | The most space the backup can use, like `500G`, `1.5T` or `200M`. Units are base 10, like disk sizes: `1K` is 1000 bytes. |
 | `--min-versions n` | unlimited | To stay under `--max-size`, the oldest previous versions can be removed, but each file keeps at least this many. With the default nothing is removed, and `backup` stops when it's full. |
 | `--keep-deleted days` | forever | How long a deleted file is kept. After that, every version of it is removed. |
 | `--no-compress pattern` | already compressed formats | Adds a pattern of files that aren't compressed, matched like excludes but ignoring case. `--compress pattern` removes one. Changes only affect files backed up from then on. |
