@@ -26,32 +26,14 @@ was at any point in time.
 
 ## Install
 
-Run the command for your system. It downloads the latest release and puts
-`amber` in `/usr/local/bin`. Run it again to update.
-
-macOS (Apple silicon):
+On Linux or macOS:
 
 ```bash
-curl -fsSL https://github.com/elliotchance/amber/releases/latest/download/amber-macos-arm64.zip -o /tmp/amber.zip && sudo unzip -o /tmp/amber.zip -d /usr/local/bin && rm /tmp/amber.zip
+curl -fsSL https://raw.githubusercontent.com/elliotchance/amber/main/install.sh | sh
 ```
 
-macOS (Intel):
-
-```bash
-curl -fsSL https://github.com/elliotchance/amber/releases/latest/download/amber-macos-x86-64.zip -o /tmp/amber.zip && sudo unzip -o /tmp/amber.zip -d /usr/local/bin && rm /tmp/amber.zip
-```
-
-Linux (x86-64):
-
-```bash
-curl -fsSL https://github.com/elliotchance/amber/releases/latest/download/amber-linux-x86-64.zip -o /tmp/amber.zip && sudo unzip -o /tmp/amber.zip -d /usr/local/bin && rm /tmp/amber.zip
-```
-
-Linux (ARM64):
-
-```bash
-curl -fsSL https://github.com/elliotchance/amber/releases/latest/download/amber-linux-arm64.zip -o /tmp/amber.zip && sudo unzip -o /tmp/amber.zip -d /usr/local/bin && rm /tmp/amber.zip
-```
+It installs the latest release in `~/.local/bin` (or `AMBER_INSTALL_DIR`). Run it
+again to update.
 
 `amber version` shows the version you have:
 
