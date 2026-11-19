@@ -1,0 +1,8 @@
+**/.DS_Store
+/amber
+*.vsql
+*.vsql.session
+*.vsql.wal
+.vscode
+*.vsql.isolation
+*.vsql.isolation.queue
