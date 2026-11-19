@@ -43,7 +43,10 @@ fn stats(b Backup, now i64) ![]string {
 	lines << 'Deleted files:  ${deleted_paths}'
 	lines << 'Versions:       ${versions}'
 	lines << ''
-	lines << 'Chunks:         ${objects} (${zipped} zipped, ${human_size(avg_chunk)} average)'
+	// The average is of what was actually stored, before compression. Small
+	// files are one chunk each, so it's often much smaller than avg_chunk.
+	average := if objects == 0 { '' } else { ', ${human_size(original / objects)} average' }
+	lines << 'Chunks:         ${objects} (${zipped} zipped${average})'
 	lines << 'Original size:  ${human_size(original)}'
 	mut stored_line := 'Stored size:    ${human_size(stored)}'
 	if original > 0 {

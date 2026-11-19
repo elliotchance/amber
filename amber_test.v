@@ -274,7 +274,7 @@ fn test_stats() {
 	assert 'Files:          1 (117.2 KiB)' in lines
 	assert 'Deleted files:  1' in lines
 	assert 'Versions:       3' in lines
-	assert 'Chunks:         2 (1 zipped, 4.0 MiB average)' in lines
+	assert 'Chunks:         2 (1 zipped, 58.6 KiB average)' in lines
 }
 
 fn test_human_size() {
