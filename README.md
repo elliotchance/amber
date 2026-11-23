@@ -94,14 +94,19 @@ amber backup -d /Volumes/Backup/documents
 ```
 new      Notes/ideas.txt
 changed  Notes/todo.txt
+moved    draft.txt -> Notes/plan.txt
 deleted  old.txt
-1 new, 1 changed, 1 deleted, 120 unchanged
+1 new, 1 changed, 1 moved, 1 deleted, 120 unchanged
 ```
 
 Files that haven't changed since the last backup are skipped. Each new file,
 change or delete becomes a new version of that file. Only the parts of a file
 that changed take up more space, and identical content is only stored once.
 Files are compressed when that saves space. Symbolic links are skipped.
+
+A new file with the same contents as one that's gone is shown as moved. In the
+backup it's still a delete of the old path and a new file, so either can be
+restored as it was. Empty files are never shown as moved.
 
 If the backup is interrupted, or runs out of space, everything backed up until
 then is kept, and running `backup` again carries on from there.

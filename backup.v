@@ -7,6 +7,7 @@ struct BackupStats {
 mut:
 	new       int
 	changed   int
+	moved     int // new paths with the same contents as a path that's gone
 	unchanged int
 	deleted   int
 	skipped   int
@@ -38,12 +39,30 @@ fn backup(b Backup, now i64, log fn (string)) !BackupStats {
 
 	walker := new_walker(config)
 	paths := walker.paths()
-
-	mut w := new_index_writer(mut db, now) or { return at(.write_index, err) }
 	mut seen := map[string]bool{}
-
 	for path in paths {
 		seen[path] = true
+	}
+
+	// The paths that are gone, and are recorded as deleted at the end. A new
+	// file with the same contents (SHA-256) as one of them is reported as a
+	// move of it. Its history is still a delete of the old path and a new
+	// path, so either can be restored as it was. Empty files aren't matched,
+	// since any two of them are the same.
+	mut gone := latest.keys().filter(!latest[it].deleted && it !in seen)
+	gone.sort()
+	mut gone_by_sha := map[string][]string{}
+	for path in gone {
+		v := latest[path]
+		if v.size > 0 && walker.covers(path) {
+			gone_by_sha[v.sha256] << path
+		}
+	}
+	mut moved := map[string]bool{}
+
+	mut w := new_index_writer(mut db, now) or { return at(.write_index, err) }
+
+	for path in paths {
 		st := file_stat(walker.abs(path)) or {
 			log('skipped  ${path}: ${err}')
 			result.skipped++
@@ -84,16 +103,20 @@ fn backup(b Backup, now i64, log fn (string)) !BackupStats {
 			manifests[file.manifest] = true
 		}
 		if prev.version == 0 || prev.deleted {
-			log('new      ${path}')
-			result.new++
+			if from := take_move(mut gone_by_sha, file.sha256, st.size) {
+				moved[from] = true
+				log('moved    ${from} -> ${path}')
+				result.moved++
+			} else {
+				log('new      ${path}')
+				result.new++
+			}
 		} else {
 			log('changed  ${path}')
 			result.changed++
 		}
 	}
 
-	mut gone := latest.keys().filter(!latest[it].deleted && it !in seen)
-	gone.sort()
 	w.begin() or { return at(.write_index, err) }
 	for path in gone {
 		// A path that's no longer included (or is now excluded) wasn't deleted,
@@ -103,13 +126,29 @@ fn backup(b Backup, now i64, log fn (string)) !BackupStats {
 			continue
 		}
 		w.add_delete(path, latest[path].version + 1) or { return at(.write_index, err) }
-		log('deleted  ${path}')
-		result.deleted++
+		if path !in moved {
+			log('deleted  ${path}')
+			result.deleted++
+		}
 	}
 
 	w.commit() or { return at(.write_index, err) }
 	result.pruned += prune(mut db, config, now, log)!.versions
 	return result
+}
+
+// take_move is the first gone path with the contents sha, which is removed
+// so that it's only matched once.
+fn take_move(mut gone_by_sha map[string][]string, sha string, size i64) ?string {
+	if size == 0 {
+		return none
+	}
+	paths := gone_by_sha[sha] or { return none }
+	if paths.len == 0 {
+		return none
+	}
+	gone_by_sha[sha] = paths[1..]
+	return paths[0]
 }
 
 struct NewObject {

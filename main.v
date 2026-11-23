@@ -272,7 +272,7 @@ fn cmd_backup(args []string) ! {
 		println(line)
 	})!
 	update_readme(b, now)
-	mut summary := '${result.new} new, ${result.changed} changed, ${result.deleted} deleted, ${result.unchanged} unchanged'
+	mut summary := '${result.new} new, ${result.changed} changed, ${result.moved} moved, ${result.deleted} deleted, ${result.unchanged} unchanged'
 	if result.skipped > 0 {
 		summary += ', ${result.skipped} skipped'
 	}
