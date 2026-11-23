@@ -1117,3 +1117,43 @@ fn test_readme() {
 fn test_version_line() {
 	assert version_line() == 'dev'
 }
+
+fn test_backup_detects_moves() {
+	e := new_env('moves')
+	e.init([])
+	e.write('a.txt', 'aaa')
+	e.write('b.txt', 'bbb')
+	e.write('c.txt', 'ccc')
+	e.write('dup1.txt', 'same')
+	e.write('dup2.txt', 'same')
+	e.write('empty.txt', '')
+	e.backup(1 * day)
+
+	os.mkdir_all(os.join_path(e.src, 'docs'))!
+	os.mv(os.join_path(e.src, 'a.txt'), os.join_path(e.src, 'docs/a.txt'))!
+	os.rm(os.join_path(e.src, 'b.txt'))!
+	e.write('b2.txt', 'bbb!') // different contents, so not a move
+	os.rm(os.join_path(e.src, 'c.txt'))! // just deleted
+	os.mv(os.join_path(e.src, 'dup1.txt'), os.join_path(e.src, 'dup3.txt'))! // one of two the same
+	os.rm(os.join_path(e.src, 'empty.txt'))!
+	e.write('empty2.txt', '') // empty files are never moves
+
+	mut lines := []string{}
+	mut log := &lines
+	result := backup(e.db, 2 * day, fn [mut log] (line string) {
+		log << line
+	})!
+	assert result.moved == 2
+	assert result.new == 2
+	assert result.deleted == 3
+	assert 'moved    a.txt -> docs/a.txt' in lines
+	assert 'moved    dup1.txt -> dup3.txt' in lines
+	assert 'deleted  b.txt' in lines
+	assert 'deleted  c.txt' in lines
+	assert 'deleted  empty.txt' in lines
+
+	// The history is still a delete of the old path and a new path.
+	assert e.versions('a.txt') == [1, 2]
+	assert e.versions('docs/a.txt') == [1]
+	assert ls(e.db, ['.'], 1 * day)!.any(it.ends_with('  a.txt'))
+}
